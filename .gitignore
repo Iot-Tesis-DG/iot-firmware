@@ -1,0 +1,18 @@
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+cmake-build-*/
+build/
+*.o
+*.elf
+*.bin
+*.map
+
+# No incluir certificados generados (cada despliegue tiene los suyos).
+# Solo se sube el README con instrucciones.
+data/certs/*.pem
+!data/certs/README.md
+
+# Credenciales locales
+include/config_local.h
