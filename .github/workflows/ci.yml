@@ -1,0 +1,43 @@
+name: CI
+
+# El firmware de este repositorio estuvo sin compilar y nadie lo detectó,
+# porque compilarlo exigía tener PlatformIO instalado en local. Este workflow
+# hace que un `pio run` roto rompa el build en el servidor.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  compilar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cachear plataformas y librerías de PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Instalar PlatformIO
+        run: pip install platformio
+
+      - name: Compilar firmware
+        run: pio run
+
+      # El certificado CA real no está en el repositorio (.gitignore), así que
+      # se crea un marcador para que `buildfs` pueda empaquetar LittleFS. Solo
+      # comprueba que la imagen del sistema de archivos se genera; no valida TLS.
+      - name: Construir imagen LittleFS
+        run: |
+          mkdir -p data/certs
+          [ -f data/certs/root_ca.pem ] || echo "placeholder-ci" > data/certs/root_ca.pem
+          pio run --target buildfs

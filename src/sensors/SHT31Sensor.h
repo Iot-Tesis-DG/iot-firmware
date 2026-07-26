@@ -23,6 +23,9 @@ public:
     bool isConnected() const { return _connected; }
 
 private:
+    /// Reintenta la deteccion I2C si el sensor se marco como caido.
+    bool _reintentarSiCaido();
+
     Adafruit_SHT31 _sht;
     bool _connected = false;
     static constexpr float MIN_TEMP = -40.0f;

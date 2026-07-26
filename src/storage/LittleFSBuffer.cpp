@@ -2,7 +2,6 @@
 #include "../config.h"
 #include <SPIFFS.h>  // Necesario para compatibilidad de LittleFS con Arduino
 
-LittleFSBuffer::LittleFSBuffer() {}
 
 bool LittleFSBuffer::begin() {
     if (!LittleFS.begin(true, LITTLEFS_MOUNT_POINT, 10, "littlefs")) {
@@ -110,7 +109,7 @@ String LittleFSBuffer::readFile(const String& filename) const {
 bool LittleFSBuffer::removeFile(const String& filename) {
     String fullPath = _pendingDir + "/" + filename;
     if (LittleFS.remove(fullPath)) {
-        LOG_I("LittleFS", "Eliminado (PUBACK confirmado): %s", filename.c_str());
+        LOG_I("LittleFS", "Eliminado (publicado): %s", filename.c_str());
         return true;
     }
     LOG_E("LittleFS", "No se pudo eliminar '%s'.", fullPath.c_str());
@@ -134,7 +133,12 @@ size_t LittleFSBuffer::usedSpace() const {
 }
 
 String LittleFSBuffer::_makeFilename(int index) const {
-    char buf[10];
+    // 16 bytes, no 10: "00001.json" son 10 caracteres MÁS el terminador, así
+    // que con `char buf[10]` snprintf truncaba y todos los archivos se creaban
+    // como "00001.jso". El buffer funcionaba —se listaban y borraban con el
+    // mismo nombre truncado— pero no coincidía con lo documentado y confundía
+    // cualquier inspección del sistema de archivos.
+    char buf[16];
     snprintf(buf, sizeof(buf), "%05d.json", index);
     return String(buf);
 }

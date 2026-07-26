@@ -23,8 +23,22 @@ bool SHT31Sensor::begin() {
     return true;
 }
 
+/// Reintenta detectar el sensor si se marcó como caído.
+///
+/// `begin()` solo se llama en `setup()`. Si el SHT31 no respondía en ese
+/// instante —alimentación aún estabilizándose, un dupont flojo— quedaba
+/// descartado para siempre y el nodo publicaba `temperatura_ambiental: null` y
+/// `humedad_ambiental: null` durante toda la sesión sin volver a intentarlo.
+bool SHT31Sensor::_reintentarSiCaido() {
+    if (_connected) return true;
+    if (!_sht.begin(SHT31_I2C_ADDRESS)) return false;
+    _connected = true;
+    LOG_I("SHT31", "Sensor recuperado tras fallo previo.");
+    return true;
+}
+
 float SHT31Sensor::readTemperatureC() {
-    if (!_connected) return NAN;
+    if (!_reintentarSiCaido()) return NAN;
 
     float t = _sht.readTemperature();
     if (isnan(t)) {
@@ -42,7 +56,7 @@ float SHT31Sensor::readTemperatureC() {
 }
 
 float SHT31Sensor::readHumidity() {
-    if (!_connected) return NAN;
+    if (!_reintentarSiCaido()) return NAN;
 
     float h = _sht.readHumidity();
     if (isnan(h)) {

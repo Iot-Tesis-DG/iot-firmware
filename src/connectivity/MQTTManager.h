@@ -13,12 +13,12 @@
  * - SNI (Server Name Indication): configurado en el cliente TLS.
  * - LWT (Last Will and Testament): el broker publica automaticamente
  *   "offline" si el ESP32 se desconecta abruptamente.
- * - QoS 1: el ESP32 retiene cada lectura en LittleFS hasta recibir PUBACK.
- * - Callback: las confirmaciones de publicación (PUBACK) se reciben aquí.
+ * - Publicación en QoS 0: PubSubClient no implementa QoS 1 al publicar, así
+ *   que no hay PUBACK ni packetId. El LWT sí se registra en QoS 1.
+ * - El buffer LittleFS se libera tras publicar y revalidar la sesión.
  */
 class MQTTManager {
 public:
-    using OnPublishAck = void (*)(uint16_t packetId, bool success);
 
     MQTTManager(WiFiClientSecure& tlsClient);
 
@@ -27,16 +27,13 @@ public:
                const char* clientId);
 
     bool connect();
-    bool isConnected() const;
+    bool isConnected();
     bool loop();  // Debe llamarse frecuentemente para procesar callbacks
 
     /// Publica un payload JSON. Retorna packetId (>0) si se encoló para envío.
-    /// QoS 1: el mensaje no se considera entregado hasta que llegue PUBACK.
+    /// QoS 0: devuelve 1 si el paquete salió por el socket, no si el broker
+    /// lo recibió. Ver la nota de garantías en MQTTManager.cpp.
     uint16_t publish(const char* topic, const char* payload, bool retained = false);
-
-    /// Registra callback que se invoca cuando el broker confirma la publicación
-    /// (PUBACK para QoS 1). El firmware usa esto para liberar el buffer LittleFS.
-    void onPublishAcknowledged(OnPublishAck callback);
 
     /// Publica evento de conectividad (online/offline)
     uint16_t publishEvent(const char* eventJson);
@@ -46,7 +43,6 @@ public:
 private:
     WiFiClientSecure& _client;
     PubSubClient _mqtt;
-    OnPublishAck _onPublishAck = nullptr;
 
     const char* _host = nullptr;
     uint16_t _port = 8883;

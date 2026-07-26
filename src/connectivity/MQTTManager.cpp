@@ -37,8 +37,17 @@ void MQTTManager::begin(const char* host, uint16_t port,
     _password = password;
     _clientId = clientId;
 
-    // TLS 1.2 mínimo
-    _client.setMinSupportedTLS(TLSv1_2);
+    // TLS 1.2.
+    //
+    // `WiFiClientSecure` del core Arduino-ESP32 NO expone un selector de
+    // versión mínima (`setMinSupportedTLS` es API de ESP8266/BearSSL y aquí no
+    // existe: su uso impedía compilar). No hace falta: mbedTLS se compila en
+    // ESP-IDF con TLS 1.2 como único protocolo habilitado, así que el suelo ya
+    // es 1.2 y no hay downgrade posible a 1.0/1.1.
+    //
+    // La garantía que sí depende de nosotros es la autenticación del servidor:
+    // `setCACert()` más abajo. Sin ella el handshake aceptaría cualquier
+    // certificado, que es el riesgo real (MITM), no la versión del protocolo.
 
     // Timeouts
     _client.setTimeout(TLS_HANDSHAKE_TIMEOUT_MS / 1000);
@@ -57,10 +66,17 @@ void MQTTManager::begin(const char* host, uint16_t port,
     _mqtt.setServer(_host, _port);
     _mqtt.setCallback(_mqttCallback);
 
-    // Buffer de recepción ampliado para PUBACK y mensajes de control
+    // Keep-alive explícito. `MQTT_KEEPALIVE_SEC` estaba definido en config.h
+    // pero nunca se aplicaba, así que regía el valor por defecto de
+    // PubSubClient (15 s) y no los 60 s documentados. Importa porque este plazo
+    // es el que decide cuánto tarda EMQX en dar el nodo por muerto y publicar
+    // su LWT: es la latencia de detección de una caída (§3.6).
+    _mqtt.setKeepAlive(MQTT_KEEPALIVE_SEC);
+
+    // Buffer de recepción ampliado para los mensajes de control del broker
     _mqtt.setBufferSize(1024);
 
-    LOG_I("MQTT", "Configurado: %s:%d (TLS 1.2+, QoS 1, LWT activo).", _host, _port);
+    LOG_I("MQTT", "Configurado: %s:%d (TLS 1.2, publicacion QoS 0, LWT QoS 1).", _host, _port);
 }
 
 bool MQTTManager::connect() {
@@ -110,7 +126,7 @@ bool MQTTManager::connect() {
     return true;
 }
 
-bool MQTTManager::isConnected() const {
+bool MQTTManager::isConnected() {
     return _mqtt.connected();
 }
 
@@ -124,30 +140,38 @@ uint16_t MQTTManager::publish(const char* topic, const char* payload, bool retai
         return 0;
     }
 
-    // QoS 1: el broker confirma con PUBACK. El ESP32 no libera el buffer
-    // LittleFS hasta que el callback onPublishAck confirme la entrega.
+    // GARANTÍA REAL DE ENTREGA — leer antes de confiar en esto.
+    //
+    // `PubSubClient::publish()` publica SIEMPRE en QoS 0. La librería no ofrece
+    // QoS 1 en publicación: no existe PUBACK, ni packetId, ni callback de
+    // confirmación (el `onPublishAck` que este código declaraba nunca llegó a
+    // invocarse). El valor devuelto significa "el paquete se escribió en el
+    // socket TLS", no "el broker lo recibió".
+    //
+    // Consecuencia honesta: la entrega es *at-most-once* en el salto nodo →
+    // broker. Si la sesión se corta con el paquete en vuelo, esa lectura se
+    // pierde. Quien la borra del buffer es el llamador, que antes revalida la
+    // sesión (ver `drenarBuffer()` en main.cpp) — mitiga la ventana, no la
+    // elimina.
+    //
+    // Lo que sí sigue en pie:
+    //   - El LWT sí va con QoS 1: se negocia en CONNECT (parámetro willQos).
+    //   - `UNIQUE(device_id, timestamp)` en el backend hace inocuo cualquier
+    //     reenvío duplicado, así que reintentar siempre es seguro.
+    //
+    // Para *at-least-once* de verdad hay que cambiar de cliente MQTT
+    // (AsyncMqttClient expone PUBACK con packetId). Está anotado como mejora
+    // en IoT-documentacion_iot.md §8.2.
     if (!_mqtt.publish(topic, (const uint8_t*)payload, strlen(payload), retained)) {
         LOG_E("MQTT", "Fallo en publish().");
         return 0;
     }
 
-    // PubSubClient no expone el packetId directamente para QoS 1 con publish().
-    // Usamos el contador interno como aproximación. En producción se podría usar
-    // la API de bajo nivel de AsyncMQTT si se necesita el packetId exacto.
-    // Por ahora, el mecanismo de confirmación se apoya en:
-    //   1. QoS 1 garantiza "al menos una vez".
-    //   2. El backend tiene UNIQUE(device_id, timestamp) → dedup.
-    //   3. LittleFS solo se limpia al recibir LWT_ONLINE en reconexión
-    //      (flush completo tras sincronización exitosa de la cola).
-    return 1;  // Éxito
+    return 1;  // Escrito en el socket (no confirmado por el broker)
 }
 
 uint16_t MQTTManager::publishEvent(const char* eventJson) {
     return publish(TOPIC_EVENTOS, eventJson, false);
-}
-
-void MQTTManager::onPublishAcknowledged(OnPublishAck callback) {
-    _onPublishAck = callback;
 }
 
 // =========================================================================

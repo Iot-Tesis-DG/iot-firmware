@@ -10,9 +10,21 @@
  * LOW  = puerta cerrada (imán presente, contacto cerrado).
  * HIGH = puerta abierta (imán ausente, contacto abierto).
  *
- * Incluye debounce por hardware: solo se reporta un cambio de estado
- * si la señal se mantiene estable durante DEBOUNCE_MS milisegundos.
- * Además, cuenta cuánto tiempo lleva la puerta abierta.
+ * MUESTREO Y REPORTE SON COSAS DISTINTAS
+ * --------------------------------------
+ * `poll()` debe llamarse con frecuencia (cada ~50 ms) para que el antirrebote
+ * signifique algo y para no perder aperturas. El payload solo se construye
+ * cada 30 s, y una puerta de farmacia se abre y se cierra en 10-20 s: si solo
+ * se mirase el estado instantáneo en el momento del reporte, la mayoría de las
+ * aperturas reales serían invisibles.
+ *
+ * Por eso se acumula entre reportes:
+ *   - `huboApertura()`     → ¿se abrió en algún momento de la ventana?
+ *   - `duracionAperturaSegundos()` → segundos abierta acumulados en la ventana
+ *   - `limpiarReporte()`   → llamar tras publicar, para empezar otra ventana
+ *
+ * Esto es lo que exige RF-03 / HU-04: detectar la apertura, no muestrearla con
+ * suerte.
  */
 class MC38Sensor {
 public:
@@ -20,18 +32,36 @@ public:
 
     void begin();
 
-    /// true = puerta abierta, false = cerrada. Con debounce.
-    bool isOpen();
+    /// Muestrea el pin y aplica antirrebote. Llamar cada ~POLL_MS.
+    void poll();
 
-    /// Segundos que la puerta lleva abierta. 0 si está cerrada.
-    unsigned long openDurationSec() const;
+    /// Estado estable actual: true = abierta.
+    bool isOpen() const;
+
+    /// ¿La puerta estuvo abierta en algún instante desde `limpiarReporte()`?
+    bool huboApertura() const;
+
+    /// Segundos acumulados con la puerta abierta desde `limpiarReporte()`,
+    /// incluida la apertura en curso si sigue abierta.
+    unsigned long duracionAperturaSegundos() const;
+
+    /// Cierra la ventana de reporte. Llamar justo después de construir el
+    /// payload; si la puerta sigue abierta, la nueva ventana sigue contando.
+    void limpiarReporte();
+
+    /// Cadencia recomendada de `poll()`.
+    static constexpr unsigned long POLL_MS = 50;
 
 private:
     uint8_t _pin;
-    bool _currentState = false;       // false = cerrada
-    bool _lastStableState = false;
-    unsigned long _lastChangeTime = 0;
-    unsigned long _openStartTime = 0;
+    bool _estadoEstable = false;      // false = cerrada
+    bool _ultimaMuestra = false;      // última lectura cruda del pin
+    unsigned long _muestraDesde = 0;  // millis() en que _ultimaMuestra no cambia
+
+    // Ventana de reporte
+    bool _huboApertura = false;
+    unsigned long _acumuladoMs = 0;   // tiempo abierta ya cerrado en la ventana
+    unsigned long _abiertaDesde = 0;  // millis() de la apertura en curso (0 = cerrada)
 
     static constexpr unsigned long DEBOUNCE_MS = 50;   // 50 ms anti-rebote
 };

@@ -36,6 +36,14 @@ void syncNTP() {
     }
 }
 
+/// ¿El reloj se sincronizó por NTP alguna vez?
+/// Sin esto no hay forma de saber si los timestamps salen de NTP o del
+/// fallback de compilación, que se desvía y acaba siendo rechazado por el
+/// backend.
+bool ntpEstaSincronizado() {
+    return _ntpSynced;
+}
+
 String PayloadBuilder::timestampISO8601() {
     time_t now;
     if (_ntpSynced) {
@@ -43,7 +51,10 @@ String PayloadBuilder::timestampISO8601() {
     } else {
         // Fallback: hora de compilación + uptime
         if (_epochBase == 0) {
-            struct tm tm_compile;
+            // Inicializado a cero de forma explícita: `mktime()` lee también
+            // `tm_isdst`, y dejarlo con basura de pila desplazaba la hora una
+            // hora entera —o devolvía -1— de forma no determinista.
+            struct tm tm_compile = {};
             // __DATE__ = "Jul 25 2026", __TIME__ = "12:34:56"
             char month[4];
             int day, year, hour, min, sec;

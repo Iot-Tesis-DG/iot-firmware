@@ -24,7 +24,12 @@
 // =========================================================================
 // MQTT / EMQX Cloud Serverless — TLS 1.2 puerto 8883
 // =========================================================================
-#define MQTT_HOST              "tu-instancia.emqx.cloud"
+// Con guarda, igual que WIFI_* y MQTT_TOKEN: así el hostname del broker puede
+// inyectarse desde `build_flags` (-DMQTT_HOST='"..."') sin editar este archivo
+// ni arriesgarse a subirlo al repositorio.
+#ifndef MQTT_HOST
+  #define MQTT_HOST            "tu-instancia.emqx.cloud"
+#endif
 #define MQTT_PORT              8883
 #define MQTT_USERNAME          DEVICE_ID              // device_id como usuario
 #ifndef MQTT_TOKEN
@@ -41,7 +46,8 @@
 #define LWT_PAYLOAD_OFFLINE    "{\"device_id\":\"" DEVICE_ID "\",\"tipo_evento\":\"lwt_offline\",\"timestamp\":\"1970-01-01T00:00:00Z\"}"
 #define LWT_PAYLOAD_ONLINE     "{\"device_id\":\"" DEVICE_ID "\",\"tipo_evento\":\"lwt_online\",\"timestamp\":\"1970-01-01T00:00:00Z\"}"
 
-// QoS 1 — al menos una vez. El PUBACK del broker libera el buffer LittleFS.
+// MQTT_QOS aplica al LWT (parametro willQos de CONNECT). La publicacion de
+// lecturas va en QoS 0: PubSubClient no soporta QoS 1 al publicar.
 #define MQTT_QOS               1
 #define MQTT_RETAIN            0
 
@@ -76,7 +82,13 @@
 // =========================================================================
 // Timeout de operaciones
 // =========================================================================
-#define SENSOR_READ_TIMEOUT_MS  1000
+// 2000 ms, no 1000. La conversión del DS18B20 a 12 bits tarda hasta 750 ms
+// según hoja de datos, y el sondeo se hace en pasos de `delay(10)` desde una
+// tarea que comparte núcleo: 1000 ms dejaba un margen del 25 % y cualquier
+// pico de planificación marcaba el sensor como averiado. Es el sensor que va
+// junto al medicamento, así que un falso negativo aquí cuesta la variable
+// principal del experimento.
+#define SENSOR_READ_TIMEOUT_MS  2000
 #define MQTT_CONNECT_TIMEOUT_MS 15000
 #define MQTT_PUBLISH_TIMEOUT_MS 5000
 #define TLS_HANDSHAKE_TIMEOUT_MS 10000

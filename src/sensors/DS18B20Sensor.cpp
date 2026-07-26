@@ -20,7 +20,25 @@ void DS18B20Sensor::begin() {
 }
 
 float DS18B20Sensor::readTemperatureC() {
-    if (!_connected) return NAN;
+    // Reintento de detección.
+    //
+    // Antes, `_connected = false` era definitivo: un único timeout del bus o
+    // una lectura de error dejaba el sensor apagado hasta reiniciar el ESP32,
+    // porque `begin()` solo se llama en `setup()`. Y este es el sensor que va
+    // junto al medicamento: el sistema seguiría publicando
+    // `temperatura_interna: null` indefinidamente, sin alerta, porque el guard
+    // de sensores del backend trata el null como "sin dato", no como avería.
+    //
+    // Un roce en el conector 1-Wire no puede costar la variable crítica del
+    // experimento, así que se reintenta la detección en cada ciclo (30 s).
+    if (!_connected) {
+        _dallas.begin();
+        if (_dallas.getDeviceCount() == 0) return NAN;
+        _dallas.setResolution(12);
+        _dallas.setWaitForConversion(false);
+        _connected = true;
+        LOG_I("DS18B20", "Sensor recuperado tras fallo previo.");
+    }
 
     _dallas.requestTemperatures();           // Inicia conversión asíncrona en todos los sensores
     unsigned long inicio = millis();

@@ -1,0 +1,25 @@
+# Tabla de particiones ThermoTrace — ESP32 DevKitC V4 (4 MB de flash)
+#
+# Motivo de existir: el proyecto usaba `default_ffat.csv`, cuya única partición
+# de datos se llama "ffat" y es de tipo FAT. El firmware monta con
+# `LittleFS.begin(true, "/littlefs", 10, "littlefs")`, que busca una partición
+# ETIQUETADA "littlefs". Con default_ffat.csv esa partición no existe: el
+# montaje fallaba, `setup()` llamaba a `ESP.restart()` y el nodo entraba en
+# bucle de arranque. Nunca habría llegado a leer un sensor.
+#
+# La etiqueta debe ser exactamente "littlefs" y el subtipo "spiffs": es el
+# subtipo que el core Arduino-ESP32 usa para LittleFS (no hay subtipo propio).
+#
+# Reparto (coincide con lo documentado en IoT-documentacion_iot.md §2.3):
+#   app0     1216 KB  aplicación en ejecución
+#   app1     1216 KB  reservada para OTA (HU-46) — hoy sin usar
+#   littlefs 1600 KB  buffer offline FIFO + certificado CA
+#
+# 0x270000 + 0x190000 = 0x400000 = 4 MB exactos, sin hueco final.
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x5000,
+otadata,    data, ota,     0xE000,   0x2000,
+app0,       app,  ota_0,   0x10000,  0x130000,
+app1,       app,  ota_1,   0x140000, 0x130000,
+littlefs,   data, spiffs,  0x270000, 0x190000,
