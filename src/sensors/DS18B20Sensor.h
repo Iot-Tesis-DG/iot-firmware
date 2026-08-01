@@ -26,9 +26,9 @@ private:
     DallasTemperature _dallas;
     bool _connected = false;
 
-    static constexpr float ERROR_VALUE = -127.0f;
-    static constexpr float MIN_VALID = -55.0f;
-    static constexpr float MAX_VALID = 125.0f;
+    // Los umbrales (-127 °C de error, rango físico -55..125 °C) viven en
+    // `core/RangosSensores.h`, compartidos con las pruebas del host. Estaban
+    // duplicados aquí y en el .cpp, sin nada que garantizara que coincidían.
 };
 
 #endif // DS18B20_SENSOR_H

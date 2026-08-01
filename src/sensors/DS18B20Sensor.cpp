@@ -1,5 +1,8 @@
 #include "DS18B20Sensor.h"
+
 #include "../config.h"
+#include "../core/RangosSensores.h"
+#include "../system/Watchdog.h"
 
 DS18B20Sensor::DS18B20Sensor(uint8_t pin)
     : _oneWire(pin), _dallas(&_oneWire) {}
@@ -41,31 +44,38 @@ float DS18B20Sensor::readTemperatureC() {
     }
 
     _dallas.requestTemperatures();           // Inicia conversión asíncrona en todos los sensores
-    unsigned long inicio = millis();
+    const unsigned long inicio = millis();
     while (!_dallas.isConversionComplete()) {
         if (millis() - inicio > SENSOR_READ_TIMEOUT_MS) {
             LOG_E("DS18B20", "Timeout en conversión de temperatura.");
             _connected = false;
             return NAN;
         }
+        // El sondeo puede llegar a los 2 s (SENSOR_READ_TIMEOUT_MS) y esta
+        // tarea está suscrita al watchdog: hay que alimentarlo aquí dentro o el
+        // propio timeout del sensor provocaría un reinicio del nodo.
+        alimentarWatchdog();
         delay(10);
     }
 
-    float temp = _dallas.getTempCByIndex(0);
+    const float temp = _dallas.getTempCByIndex(0);
 
     // -127 °C es el código de error de DallasTemperature cuando el sensor
     // no responde (desconectado, cortocircuito, o bus roto).
-    if (temp <= ERROR_VALUE) {
+    if (core::esFalloDS18B20(temp)) {
         LOG_E("DS18B20", "Sensor no responde (valor de error: %.2f).", temp);
         _connected = false;
         return NAN;
     }
 
-    if (temp < MIN_VALID || temp > MAX_VALID) {
+    // Fuera del rango físico de la hoja de datos: la lectura es basura del bus,
+    // pero el sensor sigue respondiendo, así que no se marca como caído.
+    const float validada = core::validarDS18B20(temp);
+    if (isnan(validada)) {
         LOG_E("DS18B20", "Lectura fuera de rango físico: %.2f °C.", temp);
         return NAN;
     }
 
-    LOG_I("DS18B20", "Temperatura interna: %.2f °C", temp);
-    return temp;
+    LOG_I("DS18B20", "Temperatura interna: %.2f °C", validada);
+    return validada;
 }

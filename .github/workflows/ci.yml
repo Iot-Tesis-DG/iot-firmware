@@ -3,13 +3,45 @@ name: CI
 # El firmware de este repositorio estuvo sin compilar y nadie lo detectó,
 # porque compilarlo exigía tener PlatformIO instalado en local. Este workflow
 # hace que un `pio run` roto rompa el build en el servidor.
+#
+# Compilar, además, no era suficiente: la capa IoT no tenía ni una sola prueba
+# automatizada, así que el CI daba luz verde a cualquier cambio que enlazara.
+# El job `pruebas-host` ejecuta las pruebas unitarias de `src/core/` (contrato
+# del payload, FIFO del buffer, antirrebote, backoff, rangos de sensores,
+# reloj) en la propia máquina de CI, sin ESP32.
 on:
   push:
     branches: [main]
   pull_request:
 
 jobs:
+  pruebas-host:
+    name: Pruebas unitarias (native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cachear PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-native-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Instalar PlatformIO
+        run: pip install platformio
+
+      - name: Ejecutar pruebas unitarias
+        run: pio test -e native
+
   compilar:
+    name: Compilar firmware (esp32dev)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +63,16 @@ jobs:
         run: pip install platformio
 
       - name: Compilar firmware
-        run: pio run
+        run: pio run -e esp32dev
+
+      # Segunda compilación con DEBUG_IOT activo. Sin ella, todas las llamadas a
+      # LOG_I se expanden a `((void)0)` y el compilador nunca verifica sus
+      # cadenas de formato: un `%d` con un `size_t` pasaba el CI y solo se
+      # manifestaba al depurar sobre hardware.
+      - name: Compilar con logs de depuración
+        run: pio run -e esp32dev
+        env:
+          PLATFORMIO_BUILD_FLAGS: -DDEBUG_IOT
 
       # El certificado CA real no está en el repositorio (.gitignore), así que
       # se crea un marcador para que `buildfs` pueda empaquetar LittleFS. Solo
@@ -40,4 +81,4 @@ jobs:
         run: |
           mkdir -p data/certs
           [ -f data/certs/root_ca.pem ] || echo "placeholder-ci" > data/certs/root_ca.pem
-          pio run --target buildfs
+          pio run -e esp32dev --target buildfs

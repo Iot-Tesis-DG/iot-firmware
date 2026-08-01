@@ -7,35 +7,52 @@
 // =========================================================================
 // Identidad del dispositivo — única por nodo. CAMBIAR para cada ESP32 físico.
 // =========================================================================
-#define DEVICE_ID              "FARM-01-CDL"
+#ifndef DEVICE_ID
+  #define DEVICE_ID            "FARM-01-CDL"
+#endif
 #define FIRMWARE_VERSION       "1.0.0"
 
 // =========================================================================
-// Wi-Fi — credenciales inyectadas desde variables de entorno de PlatformIO
-// o definidas aquí para desarrollo local. En producción usar build_flags.
+// CREDENCIALES — RNF-05: cero credenciales embebidas en el código
 // =========================================================================
+// Las macros de abajo son cadenas VACÍAS a propósito. Antes tenían valores por
+// defecto en texto plano ("cambiar_en_produccion", "token_generado_en_emqx")
+// que se compilaban dentro del binario. Aunque fueran marcadores, el efecto
+// práctico era doble y malo: (a) el firmware compilaba y arrancaba con
+// credenciales inválidas fallando en el broker con un error genérico, en vez de
+// decir que no estaba aprovisionado; y (b) el patrón invitaba a editar este
+// archivo con las credenciales reales y subirlo al repositorio, que es
+// exactamente lo que RNF-05 prohíbe.
+//
+// Orden de precedencia en tiempo de ejecución (ver `system/Credenciales.h`):
+//   1. NVS  — partición cifrable, se aprovisiona por dispositivo sin recompilar
+//   2. build_flags de PlatformIO (-DWIFI_PASSWORD='"..."'), para CI y taller
+//   3. nada → el nodo NO intenta conectar y lo dice por el monitor serie
+//
+// El nodo sigue capturando y almacenando en LittleFS sin credenciales: la
+// cadena de frío se registra aunque el aprovisionamiento esté pendiente.
 #ifndef WIFI_SSID
-  #define WIFI_SSID           "THERMOSAFE_IOT"
+  #define WIFI_SSID            ""
 #endif
 #ifndef WIFI_PASSWORD
-  #define WIFI_PASSWORD       "cambiar_en_produccion"
+  #define WIFI_PASSWORD        ""
 #endif
 
 // =========================================================================
 // MQTT / EMQX Cloud Serverless — TLS 1.2 puerto 8883
 // =========================================================================
-// Con guarda, igual que WIFI_* y MQTT_TOKEN: así el hostname del broker puede
-// inyectarse desde `build_flags` (-DMQTT_HOST='"..."') sin editar este archivo
-// ni arriesgarse a subirlo al repositorio.
 #ifndef MQTT_HOST
-  #define MQTT_HOST            "tu-instancia.emqx.cloud"
+  #define MQTT_HOST            ""
 #endif
 #define MQTT_PORT              8883
-#define MQTT_USERNAME          DEVICE_ID              // device_id como usuario
 #ifndef MQTT_TOKEN
-  #define MQTT_TOKEN           "token_generado_en_emqx"
+  #define MQTT_TOKEN           ""
 #endif
+#define MQTT_USERNAME          DEVICE_ID              // device_id como usuario
 #define MQTT_CLIENT_ID         DEVICE_ID
+
+/// Espacio de nombres NVS del que se leen las credenciales aprovisionadas.
+#define CREDENCIALES_NVS_NS    "thermotrace"
 
 // Topics
 #define TOPIC_LECTURAS         "farmacias/" DEVICE_ID "/lecturas"
@@ -46,13 +63,20 @@
 #define LWT_PAYLOAD_OFFLINE    "{\"device_id\":\"" DEVICE_ID "\",\"tipo_evento\":\"lwt_offline\",\"timestamp\":\"1970-01-01T00:00:00Z\"}"
 #define LWT_PAYLOAD_ONLINE     "{\"device_id\":\"" DEVICE_ID "\",\"tipo_evento\":\"lwt_online\",\"timestamp\":\"1970-01-01T00:00:00Z\"}"
 
-// MQTT_QOS aplica al LWT (parametro willQos de CONNECT). La publicacion de
-// lecturas va en QoS 0: PubSubClient no soporta QoS 1 al publicar.
+// QoS 1 tanto en el LWT (willQos del CONNECT) como en la PUBLICACIÓN de
+// lecturas. Con PubSubClient esto era imposible —solo publicaba en QoS 0— y
+// HU-11 no se cumplía; ver la nota de migración en MQTTManager.h.
 #define MQTT_QOS               1
 #define MQTT_RETAIN            0
 
 // Keep-alive MQTT: si el broker no recibe PING en este tiempo, dispara LWT.
 #define MQTT_KEEPALIVE_SEC     60
+
+// Command timeout de lwmqtt: cuánto se espera un CONNACK o un PUBACK antes de
+// darlo por perdido. Es el tiempo que `publish()` puede llegar a BLOQUEAR, así
+// que entra directamente en el presupuesto del watchdog (system/Watchdog.h).
+// 5 s cubre con holgura el RTT a EMQX Cloud sobre TLS en una red de farmacia.
+#define MQTT_COMMAND_TIMEOUT_MS 5000
 
 // =========================================================================
 // Sensores — pines GPIO del ESP32 DevKitC V4
@@ -63,12 +87,11 @@
 
 // Intervalos
 #define INTERVALO_LECTURA_MS   30000  // 30 segundos — cadencia de muestreo
-#define INTERVALO_GUARDADO_MS  60000  // 60 segundos — volcado RAM→LittleFS
 
 // =========================================================================
 // Buffer offline LittleFS
 // =========================================================================
-#define LITTLEFS_MAX_FILES     200    // Máximo de archivos en buffer (~200 lecturas ≈ 100 minutos offline)
+#define LITTLEFS_MAX_FILES     200    // ~200 lecturas ≈ 100 minutos offline
 #define LITTLEFS_MAX_FILESIZE  512    // Bytes máximos por archivo de lectura
 #define LITTLEFS_MOUNT_POINT   "/littlefs"
 
@@ -78,6 +101,7 @@
 #define WIFI_RECONNECT_BASE_MS   1000    // 1s inicial
 #define WIFI_RECONNECT_MAX_MS    60000   // 60s tope
 #define WIFI_RECONNECT_FACTOR    2       // Duplicar cada intento
+#define WIFI_CONNECT_TIMEOUT_MS  15000   // Espera máxima por asociación
 
 // =========================================================================
 // Timeout de operaciones
@@ -89,9 +113,12 @@
 // junto al medicamento, así que un falso negativo aquí cuesta la variable
 // principal del experimento.
 #define SENSOR_READ_TIMEOUT_MS  2000
-#define MQTT_CONNECT_TIMEOUT_MS 15000
-#define MQTT_PUBLISH_TIMEOUT_MS 5000
 #define TLS_HANDSHAKE_TIMEOUT_MS 10000
+
+// Espera de `getLocalTime()` al sincronizar NTP. Es un bloqueo NO alimentable
+// (una sola llamada al SDK que no devuelve el control), así que forma parte del
+// presupuesto del watchdog: ver el `static_assert` de system/Watchdog.h.
+#define NTP_SYNC_TIMEOUT_MS     10000
 
 // =========================================================================
 // Certificado raíz de la CA para TLS — EMQX Cloud / Let's Encrypt

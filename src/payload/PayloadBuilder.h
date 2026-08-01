@@ -2,52 +2,40 @@
 #define PAYLOAD_BUILDER_H
 
 #include <Arduino.h>
-#include <ArduinoJson.h>
+
+#include "../core/PayloadCore.h"
 
 /**
  * Construye el payload JSON conforme al esquema validado por Pydantic v2
  * en el backend: LecturaPayload(device_id, timestamp, estado_conectividad,
  * firmware_version, temperatura_interna, temperatura_ambiental,
- * humedad_ambiental, apertura_refrigerador, ...).
+ * humedad_ambiental, apertura_refrigerador, duracion_apertura_segundos).
  *
- * Campos obligatorios: device_id, timestamp (ISO 8601 UTC), estado_conectividad,
- *                       firmware_version, temperatura_interna
- *
- * Campos que pueden ser null: temperatura_ambiental, humedad_ambiental
- *
- * El JSON se serializa con ArduinoJson v7. Tamaño típico: ~200-250 bytes.
+ * Esta clase es solo el envoltorio Arduino: la serialización y sus reglas
+ * (null explícito en vez de 0.0, techo de 512 bytes, escapado) viven en
+ * `core::serializarLectura()`, que se compila y se prueba en el host. Ver
+ * `core/PayloadCore.h` para el contrato y `test/test_core/` para su cobertura.
  */
 class PayloadBuilder {
 public:
     PayloadBuilder(const char* deviceId, const char* firmwareVersion);
 
+    /// Las lecturas inválidas se pasan como NAN y se serializan como `null`.
     void setTemperatureInterna(float tempC);
     void setTemperatureAmbiental(float tempC);
     void setHumidityAmbiental(float humPct);
     void setDoorOpen(bool open, unsigned long durationSec);
     void setConnectivityOnline(bool online);
 
-    /// Serializa a string JSON. Retorna "" si size > maxBytes.
+    /// Serializa a string JSON. Retorna "" si el tamaño supera `maxBytes`.
     String build(unsigned int maxBytes = 512);
 
-    /// Genera la fecha/hora UTC formateada. El ESP32 no tiene RTC real,
-    /// así que usa el tiempo de compilación + millis() como aproximación
-    /// hasta que se sincronice vía NTP.
+    /// Fecha/hora UTC en ISO 8601. El ESP32 no tiene RTC con batería: usa la
+    /// base fijada por NTP y, mientras esta no exista, la hora de compilación.
     static String timestampISO8601();
 
 private:
-    const char* _deviceId;
-    const char* _firmwareVersion;
-    float _tempInterna = NAN;
-    float _tempAmbiental = NAN;
-    float _humedad = NAN;
-    bool _doorOpen = false;
-    unsigned long _doorDurationSec = 0;
-    bool _online = false;
-
-    bool _hasTempInterna = false;
-    bool _hasTempAmbiental = false;
-    bool _hasHumedad = false;
+    core::Lectura _lectura;
 };
 
-#endif // PAYLOAD_BUILDER_H
+#endif  // PAYLOAD_BUILDER_H

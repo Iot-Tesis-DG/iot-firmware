@@ -28,8 +28,7 @@ private:
 
     Adafruit_SHT31 _sht;
     bool _connected = false;
-    static constexpr float MIN_TEMP = -40.0f;
-    static constexpr float MAX_TEMP = 125.0f;
+    // Rangos en `core/RangosSensores.h`, compartidos con las pruebas del host.
 };
 
 #endif // SHT31_SENSOR_H

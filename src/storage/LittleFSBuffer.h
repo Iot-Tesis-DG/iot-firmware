@@ -3,7 +3,12 @@
 
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+
 #include <vector>
+
+#include "../core/ColaFIFO.h"
 
 /**
  * Buffer offline-first sobre LittleFS.
@@ -11,52 +16,87 @@
  * Estructura:
  *   /littlefs/pending/
  *       00001.json   ← lectura más antigua (FIFO)
- *       00002.json
  *       ...
  *       NNNNN.json   ← lectura más reciente
  *
- * Cada archivo contiene un payload JSON de ~250 bytes.
+ * Esta clase aporta dos cosas y solo dos: el acceso real a LittleFS
+ * (`AlmacenLittleFS`) y la exclusión mutua entre núcleos. El protocolo de la
+ * cola —índices, orden FIFO, saturación, integridad— vive en `core::ColaFIFO`,
+ * que se prueba en el host con intercalados adversarios.
  *
- * Política FIFO: cuando se alcanza LITTLEFS_MAX_FILES, se elimina el más
- * antiguo y se registra evento de saturación.
+ * ACCESO DESDE DOS NÚCLEOS
+ * ------------------------
+ * Es la única estructura que ambas tareas tocan a la vez: el Core 0 escribe una
+ * lectura cada 30 s y el Core 1 recorre, lee y borra la cola. No había ninguna
+ * sincronización, y las operaciones no son atómicas:
  *
- * Los archivos se eliminan tras publicarlos y comprobar que la sesión MQTT
- * sigue viva (la publicación es QoS 0: no hay PUBACK que esperar).
- * En la práctica, la sincronización se hace por lote: cuando el ESP32 se
- * reconecta, envía todos los pendientes en orden cronológico, y solo al
- * completar la cola entera se vacía el directorio.
+ *   - El índice se calculaba listando el directorio y sumando 1. Si el Core 1
+ *     borraba entre el listado y el `open()`, el índice se reutilizaba.
+ *   - `openNextFile()` mantiene un cursor de directorio abierto mientras el
+ *     otro núcleo crea o borra entradas en ese mismo directorio.
+ *
+ * El mutex NO se mantiene durante la publicación MQTT: `drenarBuffer()` lee
+ * bajo mutex, publica fuera y borra bajo mutex otra vez. Así la espera máxima
+ * del Core 0 es una operación de flash (decenas de ms) y no un PUBACK (hasta
+ * MQTT_COMMAND_TIMEOUT_MS), que sí habría comprometido la cadencia de 30 s.
  */
 class LittleFSBuffer {
 public:
+    LittleFSBuffer();
+    ~LittleFSBuffer();
+
     bool begin();
     bool saveReading(const char* jsonPayload);
-    bool hasPending() const;
-    int pendingCount() const;
+    bool hasPending();
+    int pendingCount();
 
-    /// Devuelve la lista de archivos pendientes ordenados por nombre
-    /// (que es el orden cronológico de captura).
-    std::vector<String> listPendingFiles() const;
+    /// Pendientes en orden cronológico.
+    std::vector<String> listPendingFiles();
 
-    /// Lee el contenido de un archivo pendiente.
-    String readFile(const String& filename) const;
+    /// Lee un pendiente. Devuelve "" si no se puede leer O si el contenido no
+    /// es un payload íntegro (archivo truncado por un corte de corriente).
+    String readFile(const String& filename);
 
-    /// Elimina un archivo ya publicado.
     bool removeFile(const String& filename);
-
-    /// Elimina TODOS los archivos pendientes (tras sincronización completa).
     void clearAll();
 
-    /// Espacio libre en LittleFS (bytes).
-    size_t freeSpace() const;
-
-    /// Espacio usado (bytes).
-    size_t usedSpace() const;
+    size_t freeSpace();
+    size_t usedSpace();
 
 private:
-    String _pendingDir = "/pending";
+    /// Adaptador de `core::AlmacenLecturas` sobre LittleFS.
+    class AlmacenLittleFS : public core::AlmacenLecturas {
+    public:
+        std::vector<std::string> listar() override;
+        bool existe(const std::string& nombre) override;
+        size_t escribir(const std::string& nombre, const std::string& contenido) override;
+        bool leer(const std::string& nombre, std::string& salida) override;
+        bool borrar(const std::string& nombre) override;
 
-    String _makeFilename(int index) const;
-    int _nextFileIndex() const;
+        String rutaCompleta(const std::string& nombre) const;
+        static const char* DIRECTORIO;
+    };
+
+    AlmacenLittleFS _almacen;
+    core::ColaFIFO _cola;
+    SemaphoreHandle_t _mux = nullptr;
 };
 
-#endif // LITTLEFS_BUFFER_H
+/// RAII sobre el mutex del buffer: garantiza el `give` en todos los caminos de
+/// salida, incluidos los `return` tempranos por error de flash.
+class GuardaBuffer {
+public:
+    explicit GuardaBuffer(SemaphoreHandle_t mux) : _mux(mux) {
+        if (_mux != nullptr) xSemaphoreTakeRecursive(_mux, portMAX_DELAY);
+    }
+    ~GuardaBuffer() {
+        if (_mux != nullptr) xSemaphoreGiveRecursive(_mux);
+    }
+    GuardaBuffer(const GuardaBuffer&) = delete;
+    GuardaBuffer& operator=(const GuardaBuffer&) = delete;
+
+private:
+    SemaphoreHandle_t _mux;
+};
+
+#endif  // LITTLEFS_BUFFER_H

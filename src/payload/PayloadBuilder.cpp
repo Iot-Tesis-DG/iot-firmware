@@ -1,170 +1,108 @@
 #include "PayloadBuilder.h"
-#include "../config.h"
+
 #include <sys/time.h>
 
-// =========================================================================
-// Tiempo UTC aproximado.
-//
-// El ESP32 no tiene RTC con batería. Usamos dos estrategias:
-//   1. NTP al arrancar (configurable, ver main.cpp).
-//   2. Si NTP falla, usamos __TIME__ / __DATE__ de compilación + millis().
-//
-// El backend ya valida timestamps con ventana de ±2h (B-10), así que
-// un desfase de minutos no rompe nada. Si el backend rechaza la lectura
-// por timestamp inválido, se audita y se descarta.
-// =========================================================================
+#include "../config.h"
+#include "../core/PayloadCore.h"
+#include "../core/Reloj.h"
 
-static time_t _epochBase = 0;       // Época base (NTP o compilación)
-static unsigned long _millisBase = 0; // millis() cuando se fijó _epochBase
-static bool _ntpSynced = false;
+// =========================================================================
+// Reloj compartido entre núcleos.
+//
+// `syncNTP()` la escribe desde el Core 1 (taskRed reintenta la sincronización
+// en cada reconexión) y `timestampISO8601()` la lee desde el Core 0 cada 30 s.
+// Antes eran tres variables estáticas sueltas —`time_t`, `unsigned long` y
+// `bool`— sin ninguna sincronización: un lector podía ver la época nueva con la
+// referencia de `millis()` vieja y emitir un timestamp desplazado por el
+// uptime completo del nodo, justo en el instante en que se recupera la red.
+//
+// Se protege con un spinlock de FreeRTOS (`portMUX_TYPE`): la sección crítica
+// son unas pocas operaciones aritméticas, así que un mutex con bloqueo sería
+// más caro que la propia operación. Ninguna llamada bloqueante entra dentro.
+// =========================================================================
+static core::Reloj _reloj;
+static portMUX_TYPE _relojMux = portMUX_INITIALIZER_UNLOCKED;
 
-/// Sincroniza reloj vía NTP. Llamar en setup().
 void syncNTP() {
     configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
     struct tm timeinfo;
-    if (getLocalTime(&timeinfo, 10000)) {  // 10s timeout
-        time_t now;
-        time(&now);
-        _epochBase = now;
-        _millisBase = millis();
-        _ntpSynced = true;
-        LOG_I("NTP", "Hora sincronizada: %04d-%02d-%02dT%02d:%02d:%02dZ",
-              timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-              timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    if (getLocalTime(&timeinfo, NTP_SYNC_TIMEOUT_MS)) {  // FUERA de la sección crítica
+        time_t ahora;
+        time(&ahora);
+        const uint32_t marca = (uint32_t)millis();
+
+        portENTER_CRITICAL(&_relojMux);
+        _reloj.fijarBase(ahora, marca);
+        portEXIT_CRITICAL(&_relojMux);
+
+        LOG_I("NTP", "Hora sincronizada: %s", core::formatearISO8601(ahora).c_str());
     } else {
         LOG_E("NTP", "No se pudo sincronizar. Usando hora de compilación.");
     }
 }
 
-/// ¿El reloj se sincronizó por NTP alguna vez?
-/// Sin esto no hay forma de saber si los timestamps salen de NTP o del
-/// fallback de compilación, que se desvía y acaba siendo rechazado por el
-/// backend.
 bool ntpEstaSincronizado() {
-    return _ntpSynced;
+    portENTER_CRITICAL(&_relojMux);
+    const bool ok = _reloj.sincronizado();
+    portEXIT_CRITICAL(&_relojMux);
+    return ok;
 }
 
 String PayloadBuilder::timestampISO8601() {
-    time_t now;
-    if (_ntpSynced) {
-        now = _epochBase + ((millis() - _millisBase) / 1000);
-    } else {
-        // Fallback: hora de compilación + uptime
-        if (_epochBase == 0) {
-            // Inicializado a cero de forma explícita: `mktime()` lee también
-            // `tm_isdst`, y dejarlo con basura de pila desplazaba la hora una
-            // hora entera —o devolvía -1— de forma no determinista.
-            struct tm tm_compile = {};
-            // __DATE__ = "Jul 25 2026", __TIME__ = "12:34:56"
-            char month[4];
-            int day, year, hour, min, sec;
-            sscanf(__DATE__, "%s %d %d", month, &day, &year);
-            sscanf(__TIME__, "%d:%d:%d", &hour, &min, &sec);
-            const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun",
-                                    "Jul","Aug","Sep","Oct","Nov","Dec"};
-            tm_compile.tm_mon = 0;
-            for (int i = 0; i < 12; i++) {
-                if (strcmp(month, months[i]) == 0) { tm_compile.tm_mon = i; break; }
-            }
-            tm_compile.tm_mday = day;
-            tm_compile.tm_year = year - 1900;
-            tm_compile.tm_hour = hour;
-            tm_compile.tm_min = min;
-            tm_compile.tm_sec = sec;
-            _epochBase = mktime(&tm_compile);
-            _millisBase = millis();
-        }
-        now = _epochBase + ((millis() - _millisBase) / 1000);
-    }
+    const uint32_t marca = (uint32_t)millis();
 
-    struct tm* utc = gmtime(&now);
-    char buf[30];
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-             utc->tm_year + 1900, utc->tm_mon + 1, utc->tm_mday,
-             utc->tm_hour, utc->tm_min, utc->tm_sec);
-    return String(buf);
+    portENTER_CRITICAL(&_relojMux);
+    if (!_reloj.tieneBase()) {
+        // Sin NTP todavía: se ancla a la hora de compilación. El backend valida
+        // una ventana de ±2 h, así que esto solo sirve para las primeras horas
+        // tras el flasheo; `taskRed` reintenta NTP en cada reconexión.
+        _reloj.fijarBaseNoSincronizada(core::epocaDeCompilacion(__DATE__, __TIME__), marca);
+    }
+    const time_t ahora = _reloj.avanzar(marca);
+    portEXIT_CRITICAL(&_relojMux);
+
+    return String(core::formatearISO8601(ahora).c_str());
 }
 
 // =========================================================================
-// PayloadBuilder
+// PayloadBuilder — envoltorio Arduino sobre core::serializarLectura().
 // =========================================================================
 
-PayloadBuilder::PayloadBuilder(const char* deviceId, const char* firmwareVersion)
-    : _deviceId(deviceId), _firmwareVersion(firmwareVersion) {}
+PayloadBuilder::PayloadBuilder(const char* deviceId, const char* firmwareVersion) {
+    _lectura.deviceId = deviceId != nullptr ? deviceId : "";
+    _lectura.firmwareVersion = firmwareVersion != nullptr ? firmwareVersion : "";
+}
 
 void PayloadBuilder::setTemperatureInterna(float tempC) {
-    _tempInterna = tempC;
-    _hasTempInterna = !isnan(tempC);
+    _lectura.temperaturaInterna = tempC;
 }
 
 void PayloadBuilder::setTemperatureAmbiental(float tempC) {
-    _tempAmbiental = tempC;
-    _hasTempAmbiental = !isnan(tempC);
+    _lectura.temperaturaAmbiental = tempC;
 }
 
 void PayloadBuilder::setHumidityAmbiental(float humPct) {
-    _humedad = humPct;
-    _hasHumedad = !isnan(humPct);
+    _lectura.humedadAmbiental = humPct;
 }
 
 void PayloadBuilder::setDoorOpen(bool open, unsigned long durationSec) {
-    _doorOpen = open;
-    _doorDurationSec = durationSec;
+    _lectura.aperturaRefrigerador = open;
+    _lectura.duracionAperturaSegundos = (uint32_t)durationSec;
 }
 
 void PayloadBuilder::setConnectivityOnline(bool online) {
-    _online = online;
+    _lectura.online = online;
 }
 
 String PayloadBuilder::build(unsigned int maxBytes) {
-    JsonDocument doc;
+    _lectura.timestamp = std::string(timestampISO8601().c_str());
 
-    doc["device_id"] = _deviceId;
-    doc["timestamp"] = timestampISO8601();
-    doc["estado_conectividad"] = _online ? "online" : "offline";
-    doc["firmware_version"] = _firmwareVersion;
-
-    // =========================================================================
-    // Sensores: enviar como number o como null (no omitir campos).
-    // El backend espera exactamente estos nombres de campo (Pydantic v2).
-    // HU-05 Escenario 2: "El campo se serializa explícitamente como null
-    // con bandera de error, en vez de omitirse."
-    // =========================================================================
-    if (_hasTempInterna) {
-        doc["temperatura_interna"] = _tempInterna;
-    } else {
-        doc["temperatura_interna"] = nullptr;
+    const std::string json = core::serializarLectura(_lectura, maxBytes);
+    if (json.empty()) {
+        LOG_E("Payload", "JSON descartado: excede el maximo de %u bytes.", maxBytes);
+        return String();
     }
 
-    if (_hasTempAmbiental) {
-        doc["temperatura_ambiental"] = _tempAmbiental;
-    } else {
-        doc["temperatura_ambiental"] = nullptr;
-    }
-
-    if (_hasHumedad) {
-        doc["humedad_ambiental"] = _humedad;
-    } else {
-        doc["humedad_ambiental"] = nullptr;
-    }
-
-    doc["apertura_refrigerador"] = _doorOpen;
-
-    if (_doorOpen && _doorDurationSec > 0) {
-        doc["duracion_apertura_segundos"] = _doorDurationSec;
-    } else {
-        doc["duracion_apertura_segundos"] = 0;
-    }
-
-    // Serializar
-    String output;
-    size_t len = serializeJson(doc, output);
-
-    if (len > maxBytes) {
-        LOG_E("Payload", "JSON demasiado grande: %d bytes (máx %d).", len, maxBytes);
-        return "";
-    }
-
-    LOG_I("Payload", "JSON construido: %d bytes.", len);
-    return output;
+    LOG_I("Payload", "JSON construido: %u bytes.", (unsigned)json.size());
+    return String(json.c_str());
 }

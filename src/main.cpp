@@ -13,8 +13,8 @@
  *   1. Sensores (DS18B20, SHT31, MC-38) → lectura cada 30s
  *   2. PayloadBuilder → JSON canónico (~250 bytes)
  *   3. RAM buffer → LittleFS (si no hay red, política FIFO)
- *   4. MQTT/TLS (QoS 0 al publicar; el LWT sí va en QoS 1) → EMQX → backend
- *   5. Publicado y sesión aún viva → se libera el archivo de LittleFS
+ *   4. MQTT/TLS en QoS 1 (PUBACK del broker) → EMQX → backend
+ *   5. Solo con el PUBACK confirmado → se libera el archivo de LittleFS
  *
  * Pines (ESP32 DevKitC V4):
  *   GPIO4  → DS18B20 (1-Wire, pull-up 4.7kΩ a 3.3V)
@@ -37,8 +37,11 @@
 #include "sensors/MC38Sensor.h"
 #include "connectivity/WiFiManager.h"
 #include "connectivity/MQTTManager.h"
+#include "core/ColaFIFO.h"
 #include "storage/LittleFSBuffer.h"
 #include "payload/PayloadBuilder.h"
+#include "system/Credenciales.h"
+#include "system/Watchdog.h"
 
 // =========================================================================
 // Objetos globales (compartidos entre cores vía volatile / mutex)
@@ -49,8 +52,12 @@ MC38Sensor    mc38(PIN_MC38);
 LittleFSBuffer buffer;
 
 WiFiClientSecure tlsClient;
-WiFiManager wifi(WIFI_SSID, WIFI_PASSWORD);
+WiFiManager wifi;
 MQTTManager  mqtt(tlsClient);
+
+// Credenciales cargadas en `setup()` (NVS > build_flags). Global porque
+// `MQTTManager` guarda punteros a sus cadenas durante toda la vida del proceso.
+static CredencialesNodo credenciales;
 
 // Contador informativo de lecturas capturadas desde la última publicación.
 // Solo alimenta el log del Core 0; la cola real vive en LittleFS.
@@ -62,6 +69,7 @@ static portMUX_TYPE ramMutex = portMUX_INITIALIZER_UNLOCKED;
 // =========================================================================
 void taskSensores(void* parameter) {
     LOG_I("Core0", "Tarea de sensores iniciada en Core %d.", xPortGetCoreID());
+    suscribirTareaAlWatchdog("Sensores");
 
     TickType_t lastWakeTime = xTaskGetTickCount();
     const TickType_t intervalTicks = pdMS_TO_TICKS(INTERVALO_LECTURA_MS);
@@ -129,6 +137,7 @@ void taskSensores(void* parameter) {
             if (faltan <= (int32_t)pasoPoll) break;
             vTaskDelay(pasoPoll);
             mc38.poll();
+            alimentarWatchdog();
         }
         vTaskDelayUntil(&lastWakeTime, intervalTicks);
     }
@@ -146,54 +155,79 @@ void taskSensores(void* parameter) {
 // cada 30 s, 20 por pasada vacían el backlog completo en pocos segundos.
 static constexpr int MAX_PUBLICACIONES_POR_CICLO = 20;
 
-/// Publica lecturas pendientes de LittleFS en orden FIFO.
-/// Devuelve cuántas se entregaron. Se detiene al primer fallo: el orden
-/// cronológico de la cadena de evidencia importa más que el rendimiento.
-static int drenarBuffer() {
-    auto pending = buffer.listPendingFiles();
-    if (pending.empty()) return 0;
-
-    int enviados = 0;
-    for (const auto& file : pending) {
-        if (enviados >= MAX_PUBLICACIONES_POR_CICLO) break;
-
-        String data = buffer.readFile(file);
-        if (data.isEmpty()) {
-            // Archivo ilegible (corte de corriente a mitad de escritura): no
-            // puede reintentarse eternamente ni debe frenar la cola.
-            LOG_E("Core1", "Archivo ilegible %s — descartado.", file.c_str());
-            buffer.removeFile(file);
-            continue;
-        }
-
-        if (mqtt.publish(TOPIC_LECTURAS, data.c_str(), false) == 0) {
-            LOG_E("Core1", "Fallo al publicar %s. Reintentando luego.", file.c_str());
-            break;
-        }
-
-        // `publish()` de PubSubClient es QoS 0: confirma que el paquete salió
-        // por TCP, no que el broker lo recibiera. Antes de borrar la única
-        // copia se comprueba que la sesión siga viva; si se cayó a mitad del
-        // envío, el archivo se conserva y se reintenta. No es equivalente a un
-        // PUBACK — ver la nota de garantías de entrega en MQTTManager::publish.
-        mqtt.loop();
-        if (!mqtt.isConnected()) {
-            LOG_E("Core1", "Sesión caída tras publicar %s — se conserva.", file.c_str());
-            break;
-        }
-
-        buffer.removeFile(file);
-        enviados++;
+/// Adaptador entre la política portable de drenaje (`core::drenar`) y el
+/// cliente MQTT real. La política —qué se borra, cuándo se para, qué se
+/// descarta— vive en `core/ColaFIFO.cpp` y se prueba en el host con
+/// intercalados adversarios; aquí solo queda la llamada al broker.
+class PublicadorMQTT : public core::Publicador {
+public:
+    core::ResultadoPublicacion publicar(const std::string& payload) override {
+        // El watchdog se alimenta ANTES de cada publicación: cada PUBACK puede
+        // bloquear hasta MQTT_COMMAND_TIMEOUT_MS y en un ciclo se encadenan
+        // hasta MAX_PUBLICACIONES_POR_CICLO de ellas.
+        alimentarWatchdog();
+        return mqtt.publicarLectura(TOPIC_LECTURAS, payload.c_str());
     }
-    return enviados;
+};
+
+/// Adaptador de `LittleFSBuffer` a la interfaz que espera `core::drenar()`.
+///
+/// Toma el mutex por operación, NUNCA durante la publicación: así el Core 0
+/// nunca espera un PUBACK (hasta 5 s) para guardar su lectura de los 30 s, solo
+/// una operación de flash.
+class ColaDelBuffer : public core::AlmacenLecturas {
+public:
+    std::vector<std::string> listar() override {
+        std::vector<std::string> r;
+        for (const auto& f : buffer.listPendingFiles()) r.push_back(std::string(f.c_str()));
+        return r;
+    }
+    bool existe(const std::string&) override { return false; }
+    size_t escribir(const std::string&, const std::string&) override { return 0; }
+    bool leer(const std::string& nombre, std::string& salida) override {
+        const String contenido = buffer.readFile(String(nombre.c_str()));
+        if (contenido.isEmpty()) return false;
+        salida = std::string(contenido.c_str());
+        return true;
+    }
+    bool borrar(const std::string& nombre) override {
+        return buffer.removeFile(String(nombre.c_str()));
+    }
+};
+
+/// Publica lecturas pendientes de LittleFS en orden FIFO.
+///
+/// Un archivo solo se borra tras el PUBACK confirmado del broker (QoS 1). Antes
+/// se borraba tras un `publish()` de QoS 0 revalidando la sesión, lo que
+/// acotaba la ventana de pérdida pero no la cerraba.
+static int drenarBuffer() {
+    static ColaDelBuffer almacen;
+    static PublicadorMQTT publicador;
+    core::ColaFIFO cola(almacen, LITTLEFS_MAX_FILES, LITTLEFS_MAX_FILESIZE);
+
+    const core::ResumenDrenaje resumen =
+        core::drenar(cola, publicador, MAX_PUBLICACIONES_POR_CICLO);
+
+    if (resumen.descartados > 0) {
+        LOG_E("Core1", "%d archivo(s) ilegible(s) o truncado(s) descartado(s).",
+              resumen.descartados);
+    }
+    return resumen.confirmados;
 }
 
 void taskRed(void* parameter) {
     LOG_I("Core1", "Tarea de red iniciada en Core %d.", xPortGetCoreID());
+    suscribirTareaAlWatchdog("Red");
 
     for (;;) {
+        alimentarWatchdog();
+
         // ── 1. Mantener Wi-Fi ───────────────────────────────────────
+        // Se alimenta el watchdog entre CADA etapa bloqueante. Sin esto, el
+        // handshake TLS (10 s) y NTP (10 s) podrían encadenarse en una sola
+        // iteración y superar el plazo, aunque cada uno por separado quepa.
         wifi.maintain();
+        alimentarWatchdog();
         if (!wifi.isConnected()) {
             delay(500);
             continue;
@@ -201,7 +235,9 @@ void taskRed(void* parameter) {
 
         // ── 2. Mantener MQTT ────────────────────────────────────────
         if (!mqtt.isConnected()) {
-            if (!mqtt.connect()) {
+            const bool conectado = mqtt.connect();
+            alimentarWatchdog();  // el handshake TLS + CONNACK son el peor tramo
+            if (!conectado) {
                 delay(1000);
                 continue;
             }
@@ -225,6 +261,7 @@ void taskRed(void* parameter) {
             if (!ntpEstaSincronizado()) {
                 LOG_I("Core1", "Reintentando sincronización NTP...");
                 syncNTP();
+                alimentarWatchdog();  // getLocalTime() bloquea hasta 10 s
             }
         }
 
@@ -247,7 +284,7 @@ void taskRed(void* parameter) {
         // RNF-01.
         int enviados = drenarBuffer();
         if (enviados > 0) {
-            LOG_I("Core1", "Publicadas %d lecturas. Quedan %d en Flash.",
+            LOG_I("Core1", "Confirmadas %d lecturas (PUBACK). Quedan %d en Flash.",
                   enviados, buffer.pendingCount());
             portENTER_CRITICAL(&ramMutex);
             ramBufferCount = 0;
@@ -276,6 +313,20 @@ void setup() {
     Serial.println("╚══════════════════════════════════════════════════════╝");
     Serial.println();
 
+    // ── Watchdog ────────────────────────────────────────────────────
+    // Antes de crear las tareas: ambas se suscriben nada más arrancar.
+    inicializarWatchdog();
+
+    // ── Credenciales (RNF-05) ───────────────────────────────────────
+    credenciales = cargarCredenciales();
+    Serial.printf("[Setup] Credenciales: origen=%s, aprovisionado=%s\n",
+                  credenciales.origen.c_str(),
+                  credenciales.completas() ? "si" : "NO");
+    if (!credenciales.completas()) {
+        LOG_E("Setup", "Nodo SIN aprovisionar. Capturara y almacenara en LittleFS,");
+        LOG_E("Setup", "pero no publicara. Ver system/Credenciales.h.");
+    }
+
     // ── Inicializar LittleFS ────────────────────────────────────────
     if (!buffer.begin()) {
         LOG_E("Setup", "LittleFS no disponible. Reiniciando en 5s...");
@@ -298,6 +349,7 @@ void setup() {
     mc38.begin();
 
     // ── Inicializar Wi-Fi (Core 1) ──────────────────────────────────
+    wifi.configurar(credenciales.wifiSsid, credenciales.wifiPassword);
     wifi.begin();
 
     // ── Sincronizar reloj NTP ───────────────────────────────────────
@@ -318,7 +370,8 @@ void setup() {
     }
 
     // ── Inicializar MQTT ────────────────────────────────────────────
-    mqtt.begin(MQTT_HOST, MQTT_PORT, MQTT_USERNAME, MQTT_TOKEN, MQTT_CLIENT_ID);
+    mqtt.begin(credenciales.mqttHost.c_str(), MQTT_PORT, MQTT_USERNAME,
+               credenciales.mqttToken.c_str(), MQTT_CLIENT_ID);
 
     // ── Crear tareas en núcleos separados ───────────────────────────
     // Core 0: Sensores (prioridad más alta: la captura no puede retrasarse).
@@ -345,7 +398,8 @@ void setup() {
 
     // ── El loop() principal queda vacío: todo corre en tasks ────────
     LOG_I("Setup", "Inicialización completa. Core 0 = sensores, Core 1 = red.");
-    LOG_I("Setup", "MQTT → %s:%d (TLS 1.2, publicacion QoS 0, LWT QoS 1)", MQTT_HOST, MQTT_PORT);
+    LOG_I("Setup", "MQTT → %s:%d (TLS 1.2, publicacion QoS 1 con PUBACK)",
+          credenciales.mqttHost.c_str(), MQTT_PORT);
     LOG_I("Setup", "Tópico → %s", TOPIC_LECTURAS);
 }
 
@@ -355,18 +409,14 @@ void setup() {
 void loop() {
     // Nada. taskSensores (Core 0) y taskRed (Core 1) corren concurrentemente.
     //
-    // WATCHDOG: ninguna de las dos tareas está suscrita al Task WDT.
-    // El comentario anterior afirmaba que "el watchdog se alimenta en cada
-    // tarea", pero `esp_task_wdt_add()` no se llama en ninguna parte: sólo
-    // `loopTask` queda cubierta por el TWDT que inicializa Arduino. Si
-    // `taskRed` se quedara colgada —por ejemplo dentro del handshake TLS— nada
-    // reiniciaría el nodo.
+    // WATCHDOG: ambas tareas SÍ están ahora suscritas al TWDT (ver
+    // `system/Watchdog.h`), con el plazo subido a 30 s para tolerar los dos
+    // bloqueos legítimos de `taskRed` —15 s de asociación Wi-Fi y 10 s de
+    // NTP— y con `alimentarWatchdog()` sembrado en los bucles de sondeo. Antes
+    // solo vigilaba a `loopTask`, es decir, a este `delay(1000)`: se alimentaba
+    // siempre y no habría disparado nunca.
     //
-    // No se suscriben aquí a propósito: el TWDT de Arduino viene con 5 s de
-    // plazo y en esta tarea hay dos bloqueos legítimos más largos (15 s de
-    // conexión Wi-Fi, 10 s de NTP). Suscribirlas sin subir antes el plazo y sin
-    // sembrar `esp_task_wdt_reset()` dentro de esos bucles provocaría un ciclo
-    // de reinicios, que es peor que no tener watchdog. Queda como mejora
-    // pendiente, a validar sobre hardware real.
+    // Pendiente de validar sobre hardware real: el plazo de 30 s se eligió por
+    // análisis de los bloqueos del código, no midiendo el peor caso observado.
     delay(1000);
 }

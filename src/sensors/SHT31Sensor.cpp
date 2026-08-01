@@ -1,6 +1,9 @@
 #include "SHT31Sensor.h"
-#include "../config.h"
+
 #include <Wire.h>
+
+#include "../config.h"
+#include "../core/RangosSensores.h"
 
 SHT31Sensor::SHT31Sensor(uint8_t i2cAddress)
     : _sht() {
@@ -46,13 +49,14 @@ float SHT31Sensor::readTemperatureC() {
         return NAN;
     }
 
-    if (t < MIN_TEMP || t > MAX_TEMP) {
+    const float validada = core::validarSHT31Temperatura(t);
+    if (isnan(validada)) {
         LOG_E("SHT31", "Temperatura fuera de rango: %.2f °C.", t);
         return NAN;
     }
 
-    LOG_I("SHT31", "Temperatura ambiental: %.2f °C", t);
-    return t;
+    LOG_I("SHT31", "Temperatura ambiental: %.2f °C", validada);
+    return validada;
 }
 
 float SHT31Sensor::readHumidity() {
@@ -64,11 +68,12 @@ float SHT31Sensor::readHumidity() {
         return NAN;
     }
 
-    if (h < 0.0f || h > 100.0f) {
+    const float validada = core::validarSHT31Humedad(h);
+    if (isnan(validada)) {
         LOG_E("SHT31", "Humedad fuera de rango: %.2f %%HR.", h);
         return NAN;
     }
 
-    LOG_I("SHT31", "Humedad relativa: %.2f %%HR", h);
-    return h;
+    LOG_I("SHT31", "Humedad relativa: %.2f %%HR", validada);
+    return validada;
 }

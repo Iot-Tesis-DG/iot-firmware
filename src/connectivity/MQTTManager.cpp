@@ -1,16 +1,13 @@
 #include "MQTTManager.h"
-#include "../config.h"
+
 #include <LittleFS.h>
 
-// =========================================================================
-// Singleton para el callback estático de PubSubClient
-// =========================================================================
-static MQTTManager* _instance = nullptr;
+#include "../config.h"
+#include "../core/Credenciales.h"
 
-MQTTManager::MQTTManager(WiFiClientSecure& tlsClient)
-    : _client(tlsClient), _mqtt(tlsClient) {
-    _instance = this;
-}
+using core::ResultadoPublicacion;
+
+MQTTManager::MQTTManager(WiFiClientSecure& tlsClient) : _client(tlsClient) {}
 
 bool MQTTManager::_loadCACertificate(const char* path) {
     File cert = LittleFS.open(path, "r");
@@ -20,22 +17,44 @@ bool MQTTManager::_loadCACertificate(const char* path) {
         return false;
     }
 
-    String ca = cert.readString();
+    // El certificado se copia a un buffer propio y persistente. `setCACert()`
+    // NO copia la cadena: guarda el puntero. Antes se le pasaba el `c_str()` de
+    // un `String` local que se destruía al salir de esta función, así que
+    // mbedTLS parseaba memoria liberada durante el handshake. Que funcionara
+    // dependía de que nadie hubiera reutilizado aún ese trozo de heap.
+    _caPem = cert.readString();
     cert.close();
 
-    _client.setCACert(ca.c_str());
-    LOG_I("MQTT", "Certificado CA cargado (%d bytes).", ca.length());
+    if (_caPem.length() < 100 || _caPem.indexOf("-----BEGIN CERTIFICATE-----") < 0) {
+        LOG_E("MQTT", "'%s' no contiene un certificado PEM (%u bytes).",
+              path, (unsigned)_caPem.length());
+        _caPem = String();
+        return false;
+    }
+
+    _client.setCACert(_caPem.c_str());
+    LOG_I("MQTT", "Certificado CA cargado (%u bytes).", (unsigned)_caPem.length());
     return true;
 }
 
 void MQTTManager::begin(const char* host, uint16_t port,
-                         const char* username, const char* password,
-                         const char* clientId) {
-    _host = host;
+                        const char* username, const char* password,
+                        const char* clientId) {
+    // Copia propia: `host` y `password` vienen de un `String` cargado de NVS
+    // cuyo ciclo de vida no controlamos, y las librerías guardan el puntero.
+    _hostStr = host != nullptr ? host : "";
+    _passwordStr = password != nullptr ? password : "";
+    _host = _hostStr.c_str();
     _port = port;
     _username = username;
-    _password = password;
+    _password = _passwordStr.c_str();
     _clientId = clientId;
+
+    _credencialesOk = core::credencialValida(std::string(_hostStr.c_str())) &&
+                      core::credencialValida(std::string(_passwordStr.c_str()));
+    if (!_credencialesOk) {
+        LOG_E("MQTT", "Nodo sin aprovisionar (host o token ausentes): no se conectara.");
+    }
 
     // TLS 1.2.
     //
@@ -46,81 +65,91 @@ void MQTTManager::begin(const char* host, uint16_t port,
     // es 1.2 y no hay downgrade posible a 1.0/1.1.
     //
     // La garantía que sí depende de nosotros es la autenticación del servidor:
-    // `setCACert()` más abajo. Sin ella el handshake aceptaría cualquier
-    // certificado, que es el riesgo real (MITM), no la versión del protocolo.
-
-    // Timeouts
+    // `setCACert()`. Sin ella el handshake aceptaría cualquier certificado, que
+    // es el riesgo real (MITM), no la versión del protocolo.
     _client.setTimeout(TLS_HANDSHAKE_TIMEOUT_MS / 1000);
     _client.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_MS / 1000);
 
-    // SNI: el hostname del broker se envía durante el handshake TLS
-    // para que el servidor presente el certificado correcto.
-    // Libre de hacer en WiFiClientSecure de ESP32 — se configura automáticamente
-    // al conectar al host.
-
-    // Cargar certificado CA desde LittleFS
-    if (!_loadCACertificate(CERT_FILE)) {
-        LOG_E("MQTT", "Sin certificado CA, TLS no podrá validar el servidor.");
+    // Cargar certificado CA desde LittleFS.
+    //
+    // Si falla, el nodo NO intenta conectar (ver `connect()`). El firmware no
+    // llama a `setInsecure()` en ningún punto y no debe hacerlo: sin validación
+    // de la CA, el handshake acepta cualquier certificado y la telemetría de la
+    // cadena de frío queda expuesta a un MITM trivial. Preferimos un nodo que
+    // acumula en LittleFS y lo grita por serie a uno que publica sin cifrado
+    // verificado (RNF-05, ISVS-CRYPT-02).
+    _caCargado = _loadCACertificate(CERT_FILE);
+    if (!_caCargado) {
+        LOG_E("MQTT", "Sin certificado CA valido: no se publicara nada.");
+        LOG_E("MQTT", "Las lecturas siguen guardandose en LittleFS.");
     }
 
-    _mqtt.setServer(_host, _port);
-    _mqtt.setCallback(_mqttCallback);
+    // `begin(hostname, port, client)` conecta por NOMBRE, no por IP: es lo que
+    // hace que `WiFiClientSecure` envíe el SNI en el handshake TLS y que EMQX
+    // presente el certificado correcto.
+    _mqtt.begin(_host, _port, _client);
+    _mqtt.onMessage(_mqttCallback);
 
-    // Keep-alive explícito. `MQTT_KEEPALIVE_SEC` estaba definido en config.h
-    // pero nunca se aplicaba, así que regía el valor por defecto de
-    // PubSubClient (15 s) y no los 60 s documentados. Importa porque este plazo
-    // es el que decide cuánto tarda EMQX en dar el nodo por muerto y publicar
-    // su LWT: es la latencia de detección de una caída (§3.6).
-    _mqtt.setKeepAlive(MQTT_KEEPALIVE_SEC);
+    // Keep-alive: plazo tras el cual EMQX da el nodo por muerto y publica su
+    // LWT. Es la latencia de detección de una caída (§3.6).
+    // Command timeout: cuánto se espera un CONNACK o un PUBACK antes de darlo
+    // por perdido. Entra directamente en el presupuesto del watchdog.
+    _mqtt.setOptions(MQTT_KEEPALIVE_SEC, /*cleanSession=*/true, MQTT_COMMAND_TIMEOUT_MS);
 
-    // Buffer de recepción ampliado para los mensajes de control del broker
-    _mqtt.setBufferSize(1024);
+    // LWT registrado ANTES del CONNECT: si el ESP32 se apaga sin enviar
+    // DISCONNECT, el broker publica esto automáticamente.
+    _mqtt.setWill(TOPIC_LWT, LWT_PAYLOAD_OFFLINE, MQTT_RETAIN != 0, MQTT_QOS);
 
-    LOG_I("MQTT", "Configurado: %s:%d (TLS 1.2, publicacion QoS 0, LWT QoS 1).", _host, _port);
+    LOG_I("MQTT", "Configurado: %s:%d (TLS 1.2, publicacion QoS %d con PUBACK, LWT QoS %d).",
+          _host, _port, MQTT_QOS, MQTT_QOS);
 }
 
 bool MQTTManager::connect() {
     if (_mqtt.connected()) return true;
 
-    unsigned long ahora = millis();
-    if (ahora - _lastConnectAttempt < RECONNECT_COOLDOWN_MS) {
+    // Fallo cerrado: sin CA no hay TLS verificable, y sin credenciales el
+    // broker rechaza la conexión de todos modos. En ambos casos reintentar en
+    // bucle solo gasta energía y llena el log.
+    if (!_caCargado) return false;
+    if (!_credencialesOk) return false;
+
+    const unsigned long ahora = millis();
+    if ((unsigned long)(ahora - _lastConnectAttempt) < RECONNECT_COOLDOWN_MS) {
         return false;
     }
     _lastConnectAttempt = ahora;
 
     LOG_I("MQTT", "Conectando a %s:%d como '%s'...", _host, _port, _clientId);
 
-    // Configurar LWT ANTES de conectar: si el ESP32 se apaga sin enviar
-    // DISCONNECT, el broker publica este mensaje automáticamente.
-    // El timestamp falso será reemplazado por el broker o el backend lo
-    // interpretará como "el dispositivo se cayó".
-    if (!_mqtt.connect(
-            _clientId,
-            _username,       // device_id
-            _password,       // token
-            TOPIC_LWT,       // topic del LWT
-            MQTT_QOS,
-            MQTT_RETAIN,
-            LWT_PAYLOAD_OFFLINE  // "offline" si el nodo se cae
-        )) {
-        int estado = _mqtt.state();
-        LOG_E("MQTT", "Conexión fallida. Estado MQTT: %d", estado);
-        switch (estado) {
-            case -4: LOG_E("MQTT", "  → Timeout de conexión (¿EMQX accesible?)."); break;
-            case -2: LOG_E("MQTT", "  → Error de red (¿Wi-Fi caído?)."); break;
-            case -1: LOG_E("MQTT", "  → Timeout de handshake TLS (¿certificado CA correcto?)."); break;
-            case  4: LOG_E("MQTT", "  → Credenciales inválidas (MQTT_CREDENTIALS_REJECTED)."); break;
-            case  5: LOG_E("MQTT", "  → No autorizado (MQTT_NOT_AUTHORIZED)."); break;
-            default: break;
+    if (!_mqtt.connect(_clientId, _username, _password)) {
+        // `lastError()` es el error de transporte/protocolo de lwmqtt;
+        // `returnCode()` es el código de rechazo del propio broker. Antes solo
+        // se registraba un número de PubSubClient que mezclaba ambos planos.
+        LOG_E("MQTT", "Conexión fallida. lastError=%d, returnCode=%d",
+              (int)_mqtt.lastError(), (int)_mqtt.returnCode());
+        switch (_mqtt.returnCode()) {
+            case LWMQTT_IDENTIFIER_REJECTED:
+                LOG_E("MQTT", "  → Client ID rechazado por el broker."); break;
+            case LWMQTT_SERVER_UNAVAILABLE:
+                LOG_E("MQTT", "  → Broker no disponible."); break;
+            case LWMQTT_BAD_USERNAME_OR_PASSWORD:
+                LOG_E("MQTT", "  → Credenciales inválidas (device_id / token)."); break;
+            case LWMQTT_NOT_AUTHORIZED:
+                LOG_E("MQTT", "  → No autorizado: revisar la regla ACL en EMQX."); break;
+            default:
+                LOG_E("MQTT", "  → Sin CONNACK: ¿handshake TLS o red? Revisar la CA."); break;
         }
         return false;
     }
 
-    LOG_I("MQTT", "Conectado a EMQX. Publicando LWT 'online'...");
+    LOG_I("MQTT", "Conectado a EMQX. Publicando evento 'online'...");
 
-    // Nada más conectar, publicar evento de que estamos vivos.
-    // El backend actualiza estado_conectividad = true al recibir esto.
-    _mqtt.publish(TOPIC_LWT, LWT_PAYLOAD_ONLINE, false);
+    // Nada más conectar, avisar de que estamos vivos. Ahora en QoS 1: si el
+    // broker no lo confirma, el backend no marcaría el nodo como conectado y
+    // conviene saberlo.
+    if (publicarEvento(LWT_PAYLOAD_ONLINE) != ResultadoPublicacion::Confirmado) {
+        LOG_E("MQTT", "El broker no confirmó el evento 'online'.");
+    }
 
     LOG_I("MQTT", "Listo. Publicando en '%s'.", TOPIC_LECTURAS);
     return true;
@@ -134,53 +163,46 @@ bool MQTTManager::loop() {
     return _mqtt.loop();
 }
 
-uint16_t MQTTManager::publish(const char* topic, const char* payload, bool retained) {
+core::ResultadoPublicacion MQTTManager::publicarLectura(const char* topic, const char* payload) {
     if (!_mqtt.connected()) {
         LOG_E("MQTT", "No conectado. Imposible publicar.");
-        return 0;
+        return ResultadoPublicacion::SinConexion;
     }
 
-    // GARANTÍA REAL DE ENTREGA — leer antes de confiar en esto.
+    // GARANTÍA DE ENTREGA — QoS 1 con PUBACK verificado.
     //
-    // `PubSubClient::publish()` publica SIEMPRE en QoS 0. La librería no ofrece
-    // QoS 1 en publicación: no existe PUBACK, ni packetId, ni callback de
-    // confirmación (el `onPublishAck` que este código declaraba nunca llegó a
-    // invocarse). El valor devuelto significa "el paquete se escribió en el
-    // socket TLS", no "el broker lo recibió".
+    // `MQTTClient::publish()` con qos=1 delega en `lwmqtt_publish()`, que tras
+    // enviar el PUBLISH espera el PUBACK dentro del command timeout y comprueba
+    // que el packetId coincida con el emitido. Devuelve `true` solo entonces.
+    // Es decir: `Confirmado` significa que el broker acusó recibo, no que el
+    // paquete salió por el socket.
     //
-    // Consecuencia honesta: la entrega es *at-most-once* en el salto nodo →
-    // broker. Si la sesión se corta con el paquete en vuelo, esa lectura se
-    // pierde. Quien la borra del buffer es el llamador, que antes revalida la
-    // sesión (ver `drenarBuffer()` en main.cpp) — mitiga la ventana, no la
-    // elimina.
-    //
-    // Lo que sí sigue en pie:
-    //   - El LWT sí va con QoS 1: se negocia en CONNECT (parámetro willQos).
-    //   - `UNIQUE(device_id, timestamp)` en el backend hace inocuo cualquier
-    //     reenvío duplicado, así que reintentar siempre es seguro.
-    //
-    // Para *at-least-once* de verdad hay que cambiar de cliente MQTT
-    // (AsyncMqttClient expone PUBACK con packetId). Está anotado como mejora
-    // en IoT-documentacion_iot.md §8.2.
-    if (!_mqtt.publish(topic, (const uint8_t*)payload, strlen(payload), retained)) {
-        LOG_E("MQTT", "Fallo en publish().");
-        return 0;
+    // Con eso la entrega nodo→broker es *at-least-once* (HU-11). El reenvío por
+    // reintento es inofensivo: el backend deduplica por
+    // UNIQUE(device_id, timestamp).
+    const bool ok = _mqtt.publish(topic, payload, (int)strlen(payload),
+                                  /*retained=*/false, MQTT_QOS);
+    if (!ok) {
+        LOG_E("MQTT", "Sin PUBACK (lastError=%d). Se conserva la lectura.",
+              (int)_mqtt.lastError());
+        // lwmqtt cierra la conexión ante un error de publicación, así que se
+        // distingue "no hay sesión" de "el broker no confirmó": el llamador
+        // detiene el drenaje en ambos casos, pero el log no es el mismo.
+        return _mqtt.connected() ? ResultadoPublicacion::Fallo
+                                 : ResultadoPublicacion::SinConexion;
     }
 
-    return 1;  // Escrito en el socket (no confirmado por el broker)
+    return ResultadoPublicacion::Confirmado;
 }
 
-uint16_t MQTTManager::publishEvent(const char* eventJson) {
-    return publish(TOPIC_EVENTOS, eventJson, false);
+core::ResultadoPublicacion MQTTManager::publicarEvento(const char* eventJson) {
+    return publicarLectura(TOPIC_EVENTOS, eventJson);
 }
 
 // =========================================================================
-// Callback estático — PubSubClient no acepta lambdas con captura
+// Callback estático — el nodo no se suscribe a ningún topic
 // =========================================================================
-void MQTTManager::_mqttCallback(char* topic, byte* payload, unsigned int length) {
-    // Solo nos interesa confirmar que el mensaje se publicó.
-    // PubSubClient llama a este callback para mensajes entrantes en topics
-    // suscritos. El ESP32 no se suscribe a ningún topic, así que esto
-    // solo se activaría si el broker envía algo inesperado.
-    LOG_I("MQTT", "Mensaje recibido en topic inesperado: %s (ignorado).", topic);
+void MQTTManager::_mqttCallback(String& topic, String& payload) {
+    (void)payload;
+    LOG_I("MQTT", "Mensaje recibido en topic inesperado: %s (ignorado).", topic.c_str());
 }

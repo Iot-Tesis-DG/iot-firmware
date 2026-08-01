@@ -3,6 +3,8 @@
 
 #include <Arduino.h>
 
+#include "../core/Antirrebote.h"
+
 /**
  * Sensor MC-38 — contacto magnético de puerta (reed switch).
  *
@@ -25,6 +27,9 @@
  *
  * Esto es lo que exige RF-03 / HU-04: detectar la apertura, no muestrearla con
  * suerte.
+ *
+ * Esta clase solo hace de puente con el GPIO y el reloj: la máquina de estados
+ * del antirrebote vive en `core::Antirrebote`, que se prueba en el host.
  */
 class MC38Sensor {
 public:
@@ -51,19 +56,11 @@ public:
 
     /// Cadencia recomendada de `poll()`.
     static constexpr unsigned long POLL_MS = 50;
+    static constexpr unsigned long DEBOUNCE_MS = 50;
 
 private:
     uint8_t _pin;
-    bool _estadoEstable = false;      // false = cerrada
-    bool _ultimaMuestra = false;      // última lectura cruda del pin
-    unsigned long _muestraDesde = 0;  // millis() en que _ultimaMuestra no cambia
-
-    // Ventana de reporte
-    bool _huboApertura = false;
-    unsigned long _acumuladoMs = 0;   // tiempo abierta ya cerrado en la ventana
-    unsigned long _abiertaDesde = 0;  // millis() de la apertura en curso (0 = cerrada)
-
-    static constexpr unsigned long DEBOUNCE_MS = 50;   // 50 ms anti-rebote
+    core::Antirrebote _antirrebote{DEBOUNCE_MS};
 };
 
-#endif // MC38_SENSOR_H
+#endif  // MC38_SENSOR_H

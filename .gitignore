@@ -16,3 +16,6 @@ data/certs/*.pem
 
 # Credenciales locales
 include/config_local.h
+
+# Entorno local de PlatformIO (no global)
+.piovenv/
