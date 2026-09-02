@@ -58,6 +58,20 @@ bool WiFiManager::_connect() {
         if (millis() - inicio > WIFI_CONNECT_TIMEOUT_MS) {
             LOG_E("WiFi", "Timeout de conexión a '%s'.", _ssid.c_str());
             _backoff.registrarFallo();
+
+            // HU-08 criterio 3: la captura offline (Core 0) sigue igual —
+            // esto es solo la señal de que la ausencia de red ya no es una
+            // caída momentánea del AP.
+            if (!_diagnosticoActivo &&
+                (int)_backoff.intentos() >= WIFI_UMBRAL_DIAGNOSTICO_INTENTOS) {
+                _diagnosticoActivo = true;
+                _inicioEpisodioDiagnosticoMs = millis();
+                LOG_E("WiFi",
+                      "DIAGNOSTICO: %d intentos fallidos sin reconectar (umbral=%d). "
+                      "Posible AP fuera de alcance o credenciales invalidas. "
+                      "La captura offline continua sin interrupcion.",
+                      (int)_backoff.intentos(), WIFI_UMBRAL_DIAGNOSTICO_INTENTOS);
+            }
             return false;
         }
         // Este bucle bloquea hasta 15 s dentro de una tarea suscrita al
@@ -67,9 +81,25 @@ bool WiFiManager::_connect() {
         delay(500);
     }
 
+    if (_diagnosticoActivo) {
+        _ultimaRecuperacion.intentosFallidos = (int)_backoff.intentos();
+        _ultimaRecuperacion.duracionMs = millis() - _inicioEpisodioDiagnosticoMs;
+        _diagnosticoActivo = false;
+        _recuperacionPendiente = true;
+        LOG_I("WiFi", "Reconectado tras diagnostico activo (%d intentos, %lu ms).",
+              _ultimaRecuperacion.intentosFallidos, _ultimaRecuperacion.duracionMs);
+    }
+
     _backoff.registrarExito();
     _wasEverConnected = true;
     LOG_I("WiFi", "Conectado! IP: %s, RSSI: %d dBm.",
           WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    return true;
+}
+
+bool WiFiManager::consumirRecuperacionDeDiagnostico(RecuperacionDiagnostico& detalle) {
+    if (!_recuperacionPendiente) return false;
+    detalle = _ultimaRecuperacion;
+    _recuperacionPendiente = false;
     return true;
 }

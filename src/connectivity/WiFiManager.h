@@ -34,6 +34,24 @@ public:
     unsigned long reconnectDelayMs() const { return _backoff.retardoMs(); }
     int reconnectAttempts() const { return (int)_backoff.intentos(); }
 
+    /// HU-08 criterio 3: true mientras los reintentos fallidos superen
+    /// `WIFI_UMBRAL_DIAGNOSTICO_INTENTOS` sin reconectar. La captura offline
+    /// (Core 0 / LittleFS) no depende de esto ni se detiene por esto — es
+    /// solo la señal observable de que la ausencia de red excede lo normal.
+    bool diagnosticoActivo() const { return _diagnosticoActivo; }
+
+    /// Evidencia de un episodio de diagnóstico ya cerrado (reconectado).
+    struct RecuperacionDiagnostico {
+        int intentosFallidos = 0;
+        unsigned long duracionMs = 0;
+    };
+
+    /// true una única vez, en la pasada donde el nodo se reconecta DESPUÉS
+    /// de haber estado en diagnóstico — para que el llamador (que sí puede
+    /// publicar, con la red ya de vuelta) reporte la recuperación una sola
+    /// vez y no en cada `maintain()` posterior.
+    bool consumirRecuperacionDeDiagnostico(RecuperacionDiagnostico& detalle);
+
 private:
     String _ssid;
     String _password;
@@ -41,6 +59,10 @@ private:
                            WIFI_RECONNECT_FACTOR};
     unsigned long _lastAttemptTime = 0;
     bool _wasEverConnected = false;
+    bool _diagnosticoActivo = false;
+    bool _recuperacionPendiente = false;
+    unsigned long _inicioEpisodioDiagnosticoMs = 0;
+    RecuperacionDiagnostico _ultimaRecuperacion;
 
     bool _connect();
 };
