@@ -32,6 +32,7 @@
  *   | PUBACK por lectura (command timeout)     |  5 000 ms | NO             |
  *   | `getLocalTime()` de NTP                  | 10 000 ms | NO             |
  *   | `mqtt.loop()`                            |  < 100 ms | —              |
+ *   | Acuse lógico HU-07 (`esperarAckLogico`)  |  8 000 ms | SÍ, cada 20 ms |
  *
  * El peor tramo NO alimentable es `mqtt.connect()`: el handshake TLS y la
  * espera del CONNACK ocurren dentro de la misma llamada, sin punto intermedio

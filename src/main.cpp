@@ -14,7 +14,8 @@
  *   2. PayloadBuilder → JSON canónico (~250 bytes)
  *   3. RAM buffer → LittleFS (si no hay red, política FIFO)
  *   4. MQTT/TLS en QoS 1 (PUBACK del broker) → EMQX → backend
- *   5. Solo con el PUBACK confirmado → se libera el archivo de LittleFS
+ *   5. Solo con el PUBACK Y el acuse LÓGICO del backend (HU-07, tras su
+ *      COMMIT en PostgreSQL) → se libera el archivo de LittleFS
  *
  * Pines (ESP32 DevKitC V4):
  *   GPIO4  → DS18B20 (1-Wire, pull-up 4.7kΩ a 3.3V)
@@ -80,19 +81,52 @@ void taskSensores(void* parameter) {
         float tempAmbiental = sht31.readTemperatureC();
         float humedad = sht31.readHumidity();
 
+        // HU-15/HU-05: estado explícito por sensor. `isConnected()==false`
+        // tras la lectura es una avería real (el sensor dejó de responder);
+        // NAN con el sensor todavía conectado es una lectura fuera del rango
+        // físico de la hoja de datos (ver core/RangosSensores.h) — el backend
+        // necesita distinguir ambos casos, no solo ver `null`.
+        core::EstadoSensor estadoInterna = core::EstadoSensor::Ok;
+        if (isnan(tempInterna)) {
+            estadoInterna = ds18b20.isConnected()
+                ? core::EstadoSensor::FueraDeRango
+                : core::EstadoSensor::SensorError;
+        }
+        core::EstadoSensor estadoAmbiental = core::EstadoSensor::Ok;
+        core::EstadoSensor estadoHumedad = core::EstadoSensor::Ok;
+        if (isnan(tempAmbiental) || isnan(humedad)) {
+            // El SHT31 entrega ambos valores en una sola transacción I2C: un
+            // fallo de lectura invalida los dos (ver SHT31Sensor.h).
+            const core::EstadoSensor estadoSht31 = sht31.isConnected()
+                ? core::EstadoSensor::FueraDeRango
+                : core::EstadoSensor::SensorError;
+            if (isnan(tempAmbiental)) estadoAmbiental = estadoSht31;
+            if (isnan(humedad)) estadoHumedad = estadoSht31;
+        }
+
         // La puerta se muestrea cada 50 ms durante toda la ventana (ver la
         // espera al final del ciclo), no aquí. Se reporta si hubo apertura en
         // algún momento de los 30 s, no si justo estaba abierta al muestrear:
         // una apertura de 15 s entre dos muestras se perdía por completo.
-        bool puertaAbierta = mc38.huboApertura();
-        unsigned long duracionPuerta = mc38.duracionAperturaSegundos();
+        //
+        // HU-04: sin MC-38 instalado no se muestrea en absoluto — con el
+        // pull-up interno, un pin sin sensor flota en el mismo nivel que
+        // "abierta", así que el polling normal reportaría una apertura
+        // constante y falsa en vez de "no aplica".
+        bool puertaAbierta = false;
+        unsigned long duracionPuerta = 0;
+#if MC38_INSTALADO
+        puertaAbierta = mc38.huboApertura();
+        duracionPuerta = mc38.duracionAperturaSegundos();
+#endif
 
         // ── 2. Construir payload JSON ───────────────────────────────
         PayloadBuilder payload(DEVICE_ID, FIRMWARE_VERSION);
-        payload.setTemperatureInterna(tempInterna);
-        payload.setTemperatureAmbiental(tempAmbiental);
-        payload.setHumidityAmbiental(humedad);
+        payload.setTemperatureInterna(tempInterna, estadoInterna);
+        payload.setTemperatureAmbiental(tempAmbiental, estadoAmbiental);
+        payload.setHumidityAmbiental(humedad, estadoHumedad);
         payload.setDoorOpen(puertaAbierta, duracionPuerta);
+        payload.setMc38Instalado(MC38_INSTALADO);
         payload.setConnectivityOnline(wifi.isConnected());
 
         String json = payload.build(512);
@@ -112,7 +146,9 @@ void taskSensores(void* parameter) {
 
         // Ventana de reporte cerrada: lo que venga a partir de aquí cuenta
         // para el siguiente payload.
+#if MC38_INSTALADO
         mc38.limpiarReporte();
+#endif
 
         LOG_I("Core0", "Ciclo completado. Pendientes: %d en RAM, %d en Flash.",
               ramBufferCount, buffer.pendingCount());
@@ -136,7 +172,9 @@ void taskSensores(void* parameter) {
                 (int32_t)(lastWakeTime + intervalTicks - xTaskGetTickCount());
             if (faltan <= (int32_t)pasoPoll) break;
             vTaskDelay(pasoPoll);
+#if MC38_INSTALADO
             mc38.poll();
+#endif
             alimentarWatchdog();
         }
         vTaskDelayUntil(&lastWakeTime, intervalTicks);
@@ -166,7 +204,25 @@ public:
         // bloquear hasta MQTT_COMMAND_TIMEOUT_MS y en un ciclo se encadenan
         // hasta MAX_PUBLICACIONES_POR_CICLO de ellas.
         alimentarWatchdog();
-        return mqtt.publicarLectura(TOPIC_LECTURAS, payload.c_str());
+        const core::ResultadoPublicacion transporte =
+            mqtt.publicarLectura(TOPIC_LECTURAS, payload.c_str());
+        if (transporte != core::ResultadoPublicacion::Confirmado) {
+            return transporte;
+        }
+
+        // HU-07: el PUBACK solo confirma que el BROKER recibió el mensaje,
+        // no que el backend lo persistió. `Confirmado` —la única condición
+        // bajo la que `core::drenar()` borra el archivo de LittleFS— exige
+        // además el acuse LÓGICO de aplicación, publicado por el backend
+        // recién después de hacer COMMIT (o de rechazar la lectura de forma
+        // permanente; ver interface/main.py::_publicar_ack_lectura).
+        const std::string readingId = core::extraerCampoString(payload, "reading_id");
+        if (!mqtt.esperarAckLogico(readingId, ACK_LOGICO_TIMEOUT_MS)) {
+            LOG_E("Core1", "PUBACK si, acuse logico no (reading_id=%s). Se conserva.",
+                  readingId.c_str());
+            return core::ResultadoPublicacion::Fallo;
+        }
+        return core::ResultadoPublicacion::Confirmado;
     }
 };
 
@@ -215,9 +271,72 @@ static int drenarBuffer() {
     return resumen.confirmados;
 }
 
+/// HU-06 criterio 3: construye un evento de `/eventos` con `detalle` libre.
+/// No hace falta un escapador JSON completo porque `detalle` aquí solo
+/// contiene dígitos, texto fijo en español y timestamps ISO 8601 — ninguno
+/// de los dos produce comillas ni backslashes.
+static String construirEventoJSON(const char* tipoEvento, const String& detalle) {
+    String json = "{\"device_id\":\"" DEVICE_ID "\",\"tipo_evento\":\"";
+    json += tipoEvento;
+    json += "\",\"timestamp\":\"";
+    json += PayloadBuilder::timestampISO8601();
+    json += "\",\"detalle\":\"";
+    json += detalle;
+    json += "\"}";
+    return json;
+}
+
+/// HU-06 criterio 3: reporta lo que se perdió por saturación del buffer
+/// desde la última pasada. El registro local (LOG_E) es incondicional —
+/// ninguna pérdida queda silenciosa aunque el nodo esté sin conexión al
+/// momento de perderla—; el evento a `/eventos` es best-effort, igual que
+/// `ERROR_SENSOR`.
+static void reportarSaturacionSiHubo() {
+    const core::ColaFIFO::ResumenSaturacion saturacion = buffer.tomarResumenSaturacion();
+    if (saturacion.descartadas <= 0) return;
+
+    String detalle = String(saturacion.descartadas);
+    detalle += " lectura(s) descartada(s) por saturacion del buffer offline, periodo ";
+    detalle += saturacion.desde.c_str();
+    detalle += " a ";
+    detalle += saturacion.hasta.c_str();
+
+    LOG_E("Core1", "%s", detalle.c_str());
+
+    if (mqtt.isConnected()) {
+        if (mqtt.publicarEvento(construirEventoJSON("buffer_saturado", detalle).c_str())
+            != core::ResultadoPublicacion::Confirmado) {
+            LOG_E("Core1", "El broker no confirmo el evento de saturacion (queda solo en el log local).");
+        }
+    }
+}
+
+/// HU-44 escenario 2: relee el token MQTT de NVS y, si cambió (rotación o
+/// reaprovisionamiento aplicado por un técnico con el nodo encendido),
+/// reconecta con la credencial nueva SIN `ESP.restart()`. El historial en
+/// LittleFS/backend no se toca — es la misma sesión de captura, solo cambia
+/// con qué credencial se publica de aquí en adelante.
+static void revisarRotacionCredenciales() {
+    const CredencialesNodo actualizadas = cargarCredenciales();
+    if (actualizadas.mqttToken == credenciales.mqttToken) return;
+
+    LOG_I("Core1", "Token MQTT rotado en NVS (origen=%s). Reconectando sin reinicio completo.",
+          actualizadas.origen.c_str());
+
+    // HU-13 criterio 2: DISCONNECT ordenado — el broker no debe interpretar
+    // este cierre voluntario como una caída abrupta y disparar el LWT.
+    mqtt.desconectarOrdenadamente();
+    mqtt.actualizarCredenciales(actualizadas.mqttToken.c_str());
+    credenciales = actualizadas;
+    // La reconexión ocurre en la siguiente vuelta del bucle: tras el
+    // DISCONNECT, `mqtt.isConnected()` ya es false, así que el paso 2
+    // ("Mantener MQTT") de `taskRed` se encarga, con su backoff habitual.
+}
+
 void taskRed(void* parameter) {
     LOG_I("Core1", "Tarea de red iniciada en Core %d.", xPortGetCoreID());
     suscribirTareaAlWatchdog("Red");
+    unsigned long ultimaRevisionCredenciales = millis();
 
     for (;;) {
         alimentarWatchdog();
@@ -263,6 +382,25 @@ void taskRed(void* parameter) {
                 syncNTP();
                 alimentarWatchdog();  // getLocalTime() bloquea hasta 10 s
             }
+
+            // HU-08 criterio 3: si la Wi-Fi venía de un episodio de
+            // diagnóstico (reintentos por encima del umbral operativo), este
+            // es el primer momento en que hay red para reportarlo — no se
+            // podía avisar antes, precisamente porque no había conexión.
+            WiFiManager::RecuperacionDiagnostico diagnostico;
+            if (wifi.consumirRecuperacionDeDiagnostico(diagnostico)) {
+                String detalle = "Reconectado tras ";
+                detalle += diagnostico.intentosFallidos;
+                detalle += " intento(s) fallido(s) (";
+                detalle += diagnostico.duracionMs / 1000;
+                detalle += " s sin red). Umbral de diagnostico: ";
+                detalle += WIFI_UMBRAL_DIAGNOSTICO_INTENTOS;
+                if (mqtt.publicarEvento(
+                        construirEventoJSON("wifi_reconexion_prolongada", detalle).c_str())
+                    != core::ResultadoPublicacion::Confirmado) {
+                    LOG_E("Core1", "El broker no confirmo el evento de reconexion prolongada.");
+                }
+            }
         }
 
         // ── 4. Procesar keep-alive y callbacks ──────────────────────
@@ -284,11 +422,25 @@ void taskRed(void* parameter) {
         // RNF-01.
         int enviados = drenarBuffer();
         if (enviados > 0) {
-            LOG_I("Core1", "Confirmadas %d lecturas (PUBACK). Quedan %d en Flash.",
+            LOG_I("Core1", "Confirmadas %d lecturas (PUBACK + acuse logico). Quedan %d en Flash.",
                   enviados, buffer.pendingCount());
             portENTER_CRITICAL(&ramMutex);
             ramBufferCount = 0;
             portEXIT_CRITICAL(&ramMutex);
+        }
+
+        // ── 6. Reportar saturación del buffer, si la hubo ───────────
+        reportarSaturacionSiHubo();
+
+        // ── 7. Revisar rotación de credenciales (HU-44) ─────────────
+        //
+        // Solo con sesión viva: si ya está reconectando por otra razón, el
+        // paso 2 se encarga primero y esta revisión espera a la próxima
+        // ventana de MQTT_TOKEN_POLL_INTERVAL_MS.
+        if (mqtt.isConnected() &&
+            (unsigned long)(millis() - ultimaRevisionCredenciales) >= MQTT_TOKEN_POLL_INTERVAL_MS) {
+            ultimaRevisionCredenciales = millis();
+            revisarRotacionCredenciales();
         }
 
         delay(100);  // Ceder tiempo al scheduler de FreeRTOS
@@ -346,7 +498,11 @@ void setup() {
         LOG_E("Setup", "SHT31 no detectado en 0x%02X: revisar SDA=GPIO%d / SCL=GPIO%d.",
               SHT31_I2C_ADDRESS, 21, 22);
     }
+#if MC38_INSTALADO
     mc38.begin();
+#else
+    LOG_I("Setup", "MC-38 deshabilitado por build_flag (MC38_INSTALADO=0).");
+#endif
 
     // ── Inicializar Wi-Fi (Core 1) ──────────────────────────────────
     wifi.configurar(credenciales.wifiSsid, credenciales.wifiPassword);

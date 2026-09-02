@@ -57,6 +57,18 @@
 // Topics
 #define TOPIC_LECTURAS         "farmacias/" DEVICE_ID "/lecturas"
 #define TOPIC_EVENTOS          "farmacias/" DEVICE_ID "/eventos"
+// HU-07: acuse LÓGICO de aplicación — el backend publica aquí solo después
+// de que la lectura hizo COMMIT en PostgreSQL. Distinto del PUBACK de
+// transporte QoS1 (eso solo confirma que el broker recibió el mensaje, no
+// que el backend lo persistió). Ver interface/main.py::_topico_ack().
+#define TOPIC_ACK               "farmacias/" DEVICE_ID "/ack"
+
+// HU-07: cuánto espera el nodo el acuse lógico antes de considerar la
+// publicación fallida y reintentar en el próximo ciclo. Debe cubrir con
+// holgura una escritura Postgres real (decenas de ms) más el RTT a EMQX
+// Cloud; 8 s es 60% más que MQTT_COMMAND_TIMEOUT_MS porque el acuse lógico
+// llega DESPUÉS del PUBACK, no en paralelo con él.
+#define ACK_LOGICO_TIMEOUT_MS   8000
 
 // LWT — el broker publica esto si el ESP32 se cae
 #define TOPIC_LWT              "farmacias/" DEVICE_ID "/eventos"
@@ -85,8 +97,24 @@
 #define PIN_MC38               15    // Reed switch (GPIO15, pull-up interno)
 #define SHT31_I2C_ADDRESS      0x44  // Dirección I2C por defecto del SHT31-DIS
 
+// HU-04: no todos los nodos tienen el MC-38 instalado. Con el pull-up
+// interno, un pin sin sensor conectado flota en HIGH — el mismo nivel que
+// "puerta abierta" — así que sin este flag un nodo sin MC-38 reportaría una
+// apertura constante en vez de "no aplica". Se define en build_flags por
+// nodo (-DMC38_INSTALADO=0); por defecto 1 porque es la configuración de
+// referencia del prototipo.
+#ifndef MC38_INSTALADO
+  #define MC38_INSTALADO 1
+#endif
+
 // Intervalos
 #define INTERVALO_LECTURA_MS   30000  // 30 segundos — cadencia de muestreo
+
+// HU-44 escenario 2: cada cuánto se relee el token MQTT de NVS para detectar
+// una rotación/revocación aplicada por un técnico sin reiniciar el nodo. 5
+// minutos es un compromiso entre "el corte de acceso surte efecto pronto" y
+// "no abrir `Preferences` (NVS) en cada vuelta del bucle de 100 ms".
+#define MQTT_TOKEN_POLL_INTERVAL_MS 300000
 
 // =========================================================================
 // Buffer offline LittleFS
@@ -102,6 +130,13 @@
 #define WIFI_RECONNECT_MAX_MS    60000   // 60s tope
 #define WIFI_RECONNECT_FACTOR    2       // Duplicar cada intento
 #define WIFI_CONNECT_TIMEOUT_MS  15000   // Espera máxima por asociación
+
+// HU-08 criterio 3: a partir de este número de intentos fallidos
+// consecutivos (sin reconectar), se considera que la ausencia de red supera
+// lo operativamente normal (AP fuera de alcance, credenciales inválidas) y
+// se activa la señal de diagnóstico — 5 intentos ya acumulan al menos
+// 1+2+4+8+16 = 31 s de backoff, más allá de una caída momentánea del AP.
+#define WIFI_UMBRAL_DIAGNOSTICO_INTENTOS 5
 
 // =========================================================================
 // Timeout de operaciones
