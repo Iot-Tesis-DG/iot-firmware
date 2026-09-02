@@ -73,16 +73,19 @@ PayloadBuilder::PayloadBuilder(const char* deviceId, const char* firmwareVersion
     _lectura.firmwareVersion = firmwareVersion != nullptr ? firmwareVersion : "";
 }
 
-void PayloadBuilder::setTemperatureInterna(float tempC) {
+void PayloadBuilder::setTemperatureInterna(float tempC, core::EstadoSensor estado) {
     _lectura.temperaturaInterna = tempC;
+    _lectura.estadoTemperaturaInterna = estado;
 }
 
-void PayloadBuilder::setTemperatureAmbiental(float tempC) {
+void PayloadBuilder::setTemperatureAmbiental(float tempC, core::EstadoSensor estado) {
     _lectura.temperaturaAmbiental = tempC;
+    _lectura.estadoTemperaturaAmbiental = estado;
 }
 
-void PayloadBuilder::setHumidityAmbiental(float humPct) {
+void PayloadBuilder::setHumidityAmbiental(float humPct, core::EstadoSensor estado) {
     _lectura.humedadAmbiental = humPct;
+    _lectura.estadoHumedadAmbiental = estado;
 }
 
 void PayloadBuilder::setDoorOpen(bool open, unsigned long durationSec) {
@@ -94,8 +97,17 @@ void PayloadBuilder::setConnectivityOnline(bool online) {
     _lectura.online = online;
 }
 
+void PayloadBuilder::setMc38Instalado(bool instalado) {
+    _lectura.mc38Instalado = instalado;
+}
+
 String PayloadBuilder::build(unsigned int maxBytes) {
     _lectura.timestamp = std::string(timestampISO8601().c_str());
+    // HU-05: reading_id reutiliza device_id+timestamp — ya es la clave de
+    // deduplicación del backend, así que no hace falta un contador ni RTC
+    // con persistencia propia. Se recalcula cada vez que se construye (no
+    // en el constructor) porque depende del timestamp recién fijado arriba.
+    _lectura.readingId = _lectura.deviceId + "_" + _lectura.timestamp;
 
     const std::string json = core::serializarLectura(_lectura, maxBytes);
     if (json.empty()) {
