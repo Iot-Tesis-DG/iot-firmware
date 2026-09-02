@@ -5,6 +5,8 @@
 #include <MQTT.h>
 #include <WiFiClientSecure.h>
 
+#include <string>
+
 #include "../core/ColaFIFO.h"
 
 /**
@@ -64,6 +66,28 @@ public:
     /// Publica un evento de conectividad (QoS 1, sin retención).
     core::ResultadoPublicacion publicarEvento(const char* eventJson);
 
+    /// HU-07: espera el acuse LÓGICO de aplicación para `readingId` — no el
+    /// PUBACK de transporte, que ya se resolvió dentro de `publicarLectura`.
+    /// Bombea `loop()` internamente porque el acuse llega como mensaje
+    /// entrante en `TOPIC_ACK` (suscrito en `connect()`). Devuelve false si
+    /// expira `timeoutMs` sin ver ese `reading_id`: en ese caso el llamador
+    /// NO debe borrar el archivo, solo reintentarlo en el próximo ciclo.
+    bool esperarAckLogico(const std::string& readingId, unsigned long timeoutMs);
+
+    /// HU-44 escenario 2: reemplaza el token MQTT que usará el PRÓXIMO
+    /// `connect()`, sin recrear el objeto ni tocar el certificado CA. La
+    /// sesión actual (si hay una) sigue viva hasta que el llamador la cierre
+    /// explícitamente con `desconectarOrdenadamente()` — esta función sola no
+    /// fuerza una reconexión.
+    void actualizarCredenciales(const char* password);
+
+    /// HU-13 criterio 2: cierra la sesión MQTT con un DISCONNECT limpio. A
+    /// diferencia de perder la conexión (Wi-Fi caída, corte de energía), un
+    /// DISCONNECT ordenado hace que el broker NO dispare el LWT — el nodo no
+    /// debe aparecer como una caída abrupta cuando el cierre fue voluntario
+    /// (p. ej., antes de reconectar con una credencial rotada).
+    void desconectarOrdenadamente();
+
     WiFiClientSecure& getClient() { return _client; }
 
 private:
@@ -93,7 +117,21 @@ private:
     static constexpr unsigned long RECONNECT_COOLDOWN_MS = 5000;
 
     bool _loadCACertificate(const char* path);
+
+    // HU-07: `MQTTClient::onMessage` solo acepta un puntero a función libre,
+    // sin contexto de usuario — de ahí el puntero estático a la única
+    // instancia (hay exactamente un `MQTTManager` global en este firmware).
+    // El trabajo real vive en el método de instancia para poder tener estado.
+    void _onMessage(String& topic, String& payload);
     static void _mqttCallback(String& topic, String& payload);
+    static MQTTManager* _instancia;
+
+    // Último acuse lógico recibido en TOPIC_ACK, consumido por
+    // `esperarAckLogico`. Sin mutex: MQTT (`loop()`, `publish()`,
+    // `esperarAckLogico`) corre entera dentro de `taskRed` en Core 1, nunca
+    // en paralelo consigo misma.
+    std::string _ultimoAckReadingId;
+    bool _ackPendiente = false;
 };
 
 #endif  // MQTT_MANAGER_H

@@ -4,10 +4,18 @@
 
 #include "../config.h"
 #include "../core/Credenciales.h"
+#include "../core/PayloadCore.h"
+#include "../system/Watchdog.h"
 
 using core::ResultadoPublicacion;
 
-MQTTManager::MQTTManager(WiFiClientSecure& tlsClient) : _client(tlsClient) {}
+MQTTManager* MQTTManager::_instancia = nullptr;
+
+MQTTManager::MQTTManager(WiFiClientSecure& tlsClient) : _client(tlsClient) {
+    // Ver el comentario junto a `_instancia` en el header: único puntero
+    // porque `onMessage` de la librería no permite pasar contexto propio.
+    _instancia = this;
+}
 
 bool MQTTManager::_loadCACertificate(const char* path) {
     File cert = LittleFS.open(path, "r");
@@ -151,6 +159,15 @@ bool MQTTManager::connect() {
         LOG_E("MQTT", "El broker no confirmó el evento 'online'.");
     }
 
+    // HU-07: suscripción al acuse lógico de aplicación. Sin esto,
+    // `esperarAckLogico()` bombea `loop()` en vano — nunca llegaría ningún
+    // mensaje de vuelta porque el broker nunca reenvía lo que nadie pidió.
+    if (!_mqtt.subscribe(TOPIC_ACK, MQTT_QOS)) {
+        LOG_E("MQTT", "No se pudo suscribir al acuse logico (%s). "
+                      "El drenaje de LittleFS se detendra en el primer envio.",
+              TOPIC_ACK);
+    }
+
     LOG_I("MQTT", "Listo. Publicando en '%s'.", TOPIC_LECTURAS);
     return true;
 }
@@ -199,10 +216,67 @@ core::ResultadoPublicacion MQTTManager::publicarEvento(const char* eventJson) {
     return publicarLectura(TOPIC_EVENTOS, eventJson);
 }
 
+void MQTTManager::actualizarCredenciales(const char* password) {
+    // Copia propia, igual que en `begin()`: `password` puede venir de un
+    // `String` temporal del llamador cuyo ciclo de vida no controlamos, y
+    // `MQTTClient::connect()` solo guarda el puntero, no el contenido.
+    _passwordStr = password != nullptr ? password : "";
+    _password = _passwordStr.c_str();
+    _credencialesOk = core::credencialValida(std::string(_hostStr.c_str())) &&
+                      core::credencialValida(std::string(_passwordStr.c_str()));
+}
+
+void MQTTManager::desconectarOrdenadamente() {
+    if (_mqtt.connected()) {
+        _mqtt.disconnect();
+    }
+}
+
+bool MQTTManager::esperarAckLogico(const std::string& readingId, unsigned long timeoutMs) {
+    // Un reading_id vacío no se puede correlacionar con nada: firmware que
+    // aún no genera reading_id (no debería llegar aquí — PayloadBuilder::
+    // build() siempre lo fija) o payload malformado.
+    if (readingId.empty()) return false;
+
+    // El acuse para ESTA lectura pudo llegar ya durante el propio
+    // `publish()` (lwmqtt puede procesar mensajes entrantes mientras espera
+    // el PUBACK): se comprueba antes de descartar el estado pendiente, o se
+    // esperaría por un acuse que en realidad ya llegó.
+    if (_ackPendiente && _ultimoAckReadingId == readingId) {
+        _ackPendiente = false;
+        return true;
+    }
+    _ackPendiente = false;
+
+    const unsigned long inicio = millis();
+    while ((unsigned long)(millis() - inicio) < timeoutMs) {
+        _mqtt.loop();  // el acuse llega por aquí, vía _onMessage
+        if (_ackPendiente) {
+            _ackPendiente = false;
+            if (_ultimoAckReadingId == readingId) return true;
+            // Acuse de OTRA lectura (p. ej. de un ciclo anterior que llegó
+            // tarde tras un reintento): no es el que se espera, se sigue
+            // esperando con el tiempo restante.
+        }
+        alimentarWatchdog();
+        delay(20);
+    }
+    return false;
+}
+
 // =========================================================================
-// Callback estático — el nodo no se suscribe a ningún topic
+// Callback — HU-07: ahora sí importa lo que llega, es el acuse de aplicación
 // =========================================================================
-void MQTTManager::_mqttCallback(String& topic, String& payload) {
-    (void)payload;
+void MQTTManager::_onMessage(String& topic, String& payload) {
+    if (topic == TOPIC_ACK) {
+        const std::string cuerpo(payload.c_str());
+        _ultimoAckReadingId = core::extraerCampoString(cuerpo, "reading_id");
+        _ackPendiente = true;
+        return;
+    }
     LOG_I("MQTT", "Mensaje recibido en topic inesperado: %s (ignorado).", topic.c_str());
+}
+
+void MQTTManager::_mqttCallback(String& topic, String& payload) {
+    if (_instancia != nullptr) _instancia->_onMessage(topic, payload);
 }
