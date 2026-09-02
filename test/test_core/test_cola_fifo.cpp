@@ -86,6 +86,10 @@ static std::string lectura(const std::string& id) {
     return "{\"device_id\":\"FARM-01-CDL\",\"v\":\"" + id + "\"}";
 }
 
+static std::string lecturaConTimestamp(const std::string& timestamp) {
+    return "{\"device_id\":\"FARM-01-CDL\",\"timestamp\":\"" + timestamp + "\"}";
+}
+
 // ---------------------------------------------------------------------------
 // Índices y ABA
 // ---------------------------------------------------------------------------
@@ -356,6 +360,56 @@ void test_fifo_descarta_la_lectura_mas_antigua(void) {
     TEST_ASSERT_EQUAL_STRING(lectura("B").c_str(), payload.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// HU-06 criterio 3: ninguna pérdida por saturación queda silenciosa
+// ---------------------------------------------------------------------------
+
+void test_sin_saturacion_el_resumen_esta_vacio(void) {
+    AlmacenMemoria alm;
+    core::ColaFIFO cola(alm, 200, 512);
+    cola.guardar(lectura("A"));
+
+    const auto resumen = cola.tomarResumenSaturacion();
+    TEST_ASSERT_EQUAL_INT(0, resumen.descartadas);
+    TEST_ASSERT_TRUE(resumen.desde.empty());
+    TEST_ASSERT_TRUE(resumen.hasta.empty());
+}
+
+void test_saturacion_registra_conteo_y_periodo_de_lo_descartado(void) {
+    AlmacenMemoria alm;
+    core::ColaFIFO cola(alm, 3, 512);  // cola diminuta para forzar el FIFO
+
+    cola.guardar(lecturaConTimestamp("2026-08-01T10:00:00Z"));
+    cola.guardar(lecturaConTimestamp("2026-08-01T10:02:00Z"));
+    cola.guardar(lecturaConTimestamp("2026-08-01T10:04:00Z"));
+    // Saturación: se descartan las dos primeras (00001 y 00002).
+    cola.guardar(lecturaConTimestamp("2026-08-01T10:06:00Z"));
+    cola.guardar(lecturaConTimestamp("2026-08-01T10:08:00Z"));
+
+    const auto resumen = cola.tomarResumenSaturacion();
+    TEST_ASSERT_EQUAL_INT(2, resumen.descartadas);
+    TEST_ASSERT_EQUAL_STRING("2026-08-01T10:00:00Z", resumen.desde.c_str());
+    TEST_ASSERT_EQUAL_STRING("2026-08-01T10:02:00Z", resumen.hasta.c_str());
+}
+
+/// `tomarResumenSaturacion()` consume: una segunda llamada sin nueva
+/// saturación de por medio debe volver a estar en cero.
+void test_tomar_resumen_resetea_el_contador(void) {
+    AlmacenMemoria alm;
+    core::ColaFIFO cola(alm, 3, 512);
+
+    cola.guardar(lecturaConTimestamp("2026-08-01T10:00:00Z"));
+    cola.guardar(lecturaConTimestamp("2026-08-01T10:01:00Z"));
+    cola.guardar(lecturaConTimestamp("2026-08-01T10:02:00Z"));
+    cola.guardar(lecturaConTimestamp("2026-08-01T10:03:00Z"));  // 1 descarte
+
+    TEST_ASSERT_EQUAL_INT(1, cola.tomarResumenSaturacion().descartadas);
+    TEST_ASSERT_EQUAL_INT(0, cola.tomarResumenSaturacion().descartadas);
+
+    cola.guardar(lecturaConTimestamp("2026-08-01T10:04:00Z"));  // otro descarte
+    TEST_ASSERT_EQUAL_INT(1, cola.tomarResumenSaturacion().descartadas);
+}
+
 void test_payload_fuera_de_limite_no_se_guarda(void) {
     AlmacenMemoria alm;
     core::ColaFIFO cola(alm, 200, 512);
@@ -432,4 +486,7 @@ void run_tests_cola_fifo(void) {
     RUN_TEST(test_flash_llena_no_deja_archivo_en_la_cola);
     RUN_TEST(test_fifo_descarta_la_lectura_mas_antigua);
     RUN_TEST(test_payload_fuera_de_limite_no_se_guarda);
+    RUN_TEST(test_sin_saturacion_el_resumen_esta_vacio);
+    RUN_TEST(test_saturacion_registra_conteo_y_periodo_de_lo_descartado);
+    RUN_TEST(test_tomar_resumen_resetea_el_contador);
 }

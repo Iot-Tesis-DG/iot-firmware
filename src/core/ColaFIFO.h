@@ -81,11 +81,30 @@ public:
     /// Último índice entregado. Expuesto para pruebas y diagnóstico.
     int ultimoIndice() const { return _ultimoIndice; }
 
+    /// HU-06 criterio 3: lo que se perdió por saturación desde la última vez
+    /// que se llamó a `tomarResumenSaturacion()`. `descartadas == 0` cuando no
+    /// hubo ninguna pérdida en ese lapso.
+    struct ResumenSaturacion {
+        int descartadas = 0;
+        std::string desde;  ///< timestamp (del propio payload) de la más antigua descartada
+        std::string hasta;  ///< timestamp de la más reciente descartada
+    };
+
+    /// Consume y resetea el contador de saturación. Se llama desde `taskRed`
+    /// (Core 1) para reportar la pérdida como evento — nunca queda en
+    /// silencio, ni siquiera cuando el nodo pasa horas sin conectividad
+    /// perdiendo lecturas por FIFO.
+    ResumenSaturacion tomarResumenSaturacion();
+
 private:
     AlmacenLecturas& _almacen;
     size_t _maxArchivos;
     size_t _maxBytes;
     int _ultimoIndice = 0;
+
+    int _descartadosPorSaturacion = 0;
+    std::string _primerDescarteTimestamp;
+    std::string _ultimoDescarteTimestamp;
 };
 
 // ---------------------------------------------------------------------------
@@ -94,9 +113,13 @@ private:
 
 /// Resultado de publicar una lectura.
 ///
-/// `Confirmado` significa PUBACK recibido del broker (QoS 1), no "escrito en el
-/// socket". Es la única condición bajo la que se puede borrar la única copia
-/// que existe de esa lectura.
+/// `Confirmado` es la única condición bajo la que se puede borrar la única
+/// copia que existe de esa lectura — nunca "escrito en el socket". Qué exige
+/// exactamente el `Publicador` concreto antes de devolverlo es su
+/// responsabilidad: como mínimo el PUBACK del broker (QoS 1); el adaptador
+/// MQTT real de este firmware (`PublicadorMQTT` en main.cpp) exige además el
+/// acuse LÓGICO de aplicación del backend (HU-07) — el PUBACK solo confirma
+/// que el broker recibió el mensaje, no que el backend lo persistió.
 enum class ResultadoPublicacion {
     Confirmado,
     Fallo,        ///< el broker no confirmó: conservar y reintentar

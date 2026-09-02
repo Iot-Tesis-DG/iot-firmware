@@ -60,6 +60,11 @@ public:
     bool removeFile(const String& filename);
     void clearAll();
 
+    /// HU-06 criterio 3: consume y resetea el resumen de lecturas perdidas
+    /// por saturación desde la última llamada. `descartadas == 0` si no hubo
+    /// ninguna.
+    core::ColaFIFO::ResumenSaturacion tomarResumenSaturacion();
+
     size_t freeSpace();
     size_t usedSpace();
 

@@ -124,6 +124,11 @@ bool LittleFSBuffer::saveReading(const char* jsonPayload) {
     return ok;
 }
 
+core::ColaFIFO::ResumenSaturacion LittleFSBuffer::tomarResumenSaturacion() {
+    GuardaBuffer guarda(_mux);
+    return _cola.tomarResumenSaturacion();
+}
+
 bool LittleFSBuffer::hasPending() {
     return pendingCount() > 0;
 }

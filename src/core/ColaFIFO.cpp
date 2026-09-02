@@ -1,6 +1,7 @@
 #include "ColaFIFO.h"
 
 #include "ColaArchivos.h"
+#include "PayloadCore.h"
 
 namespace core {
 
@@ -34,10 +35,25 @@ bool ColaFIFO::guardar(const std::string& payload) {
     // Saturación: se libera el más antiguo. Se usa `while` y no `if` porque una
     // reducción de `_maxArchivos` entre versiones de firmware puede dejar la
     // cola por encima del límite y un solo borrado no la devolvería al rango.
+    //
+    // HU-06 criterio 3: ninguna pérdida queda silenciosa. Antes de borrar se
+    // lee el timestamp de la propia lectura descartada (mismo extractor que
+    // el acuse lógico de HU-07) para poder reportar el periodo afectado, no
+    // solo un contador.
     std::vector<std::string> actuales = pendientes();
     while (actuales.size() >= _maxArchivos && !actuales.empty()) {
-        _almacen.borrar(actuales.front());
+        const std::string nombreDescartado = actuales.front();
+        std::string contenidoDescartado;
+        if (_almacen.leer(nombreDescartado, contenidoDescartado)) {
+            const std::string ts = extraerCampoString(contenidoDescartado, "timestamp");
+            if (!ts.empty()) {
+                if (_primerDescarteTimestamp.empty()) _primerDescarteTimestamp = ts;
+                _ultimoDescarteTimestamp = ts;
+            }
+        }
+        _almacen.borrar(nombreDescartado);
         actuales.erase(actuales.begin());
+        _descartadosPorSaturacion++;
     }
 
     _ultimoIndice = siguienteIndice(_ultimoIndice);
@@ -69,6 +85,23 @@ bool ColaFIFO::leerIntegro(const std::string& nombre, std::string& salida) {
 
 bool ColaFIFO::eliminar(const std::string& nombre) {
     return _almacen.borrar(nombre);
+}
+
+ColaFIFO::ResumenSaturacion ColaFIFO::tomarResumenSaturacion() {
+    // Asignación campo a campo, no agregado con `{}`: `ResumenSaturacion`
+    // tiene inicializadores de miembro por defecto, y gnu++11 (el estándar
+    // del framework Arduino-ESP32, distinto del gnu++17 de las pruebas de
+    // host) no la trata como agregado en ese caso — `{a, b, c}` no compila
+    // ahí aunque sí en el host.
+    ResumenSaturacion resumen;
+    resumen.descartadas = _descartadosPorSaturacion;
+    resumen.desde = _primerDescarteTimestamp;
+    resumen.hasta = _ultimoDescarteTimestamp;
+
+    _descartadosPorSaturacion = 0;
+    _primerDescarteTimestamp.clear();
+    _ultimoDescarteTimestamp.clear();
+    return resumen;
 }
 
 ResumenDrenaje drenar(ColaFIFO& cola, Publicador& publicador, int maxPorCiclo) {
