@@ -41,7 +41,9 @@
 #include "core/ColaFIFO.h"
 #include "storage/LittleFSBuffer.h"
 #include "payload/PayloadBuilder.h"
+#include "system/BootId.h"
 #include "system/Credenciales.h"
+#include "system/PowerBackup.h"
 #include "system/Watchdog.h"
 
 // =========================================================================
@@ -311,6 +313,45 @@ static void reportarSaturacionSiHubo() {
     }
 }
 
+/// HU-52: publica los eventos de conmutación/nivel de respaldo detectados en
+/// este chequeo. `revisarEstadoRespaldo()` ya aplica el patrón best-effort
+/// (sin RESPALDO_INSTALADO, siempre devuelve "sin cambios" y esta función no
+/// hace nada). Igual que `reportarSaturacionSiHubo`, un evento no confirmado
+/// por el broker queda solo en el log local — no bloquea la captura.
+static void revisarRespaldoElectrico() {
+    const EstadoRespaldo estado = revisarEstadoRespaldo();
+
+    if (estado.conmutoARespaldo) {
+        LOG_E("Core1", "Corte de suministro detectado: nodo conmutado a respaldo de 5V.");
+        if (mqtt.isConnected() &&
+            mqtt.publicarEvento(
+                construirEventoJSON("conmutacion_respaldo", "Corte de suministro comercial detectado")
+                    .c_str())
+                != core::ResultadoPublicacion::Confirmado) {
+            LOG_E("Core1", "El broker no confirmo el evento de conmutacion a respaldo.");
+        }
+    }
+    if (estado.recuperoSuministro) {
+        LOG_I("Core1", "Suministro comercial restablecido.");
+        if (mqtt.isConnected() &&
+            mqtt.publicarEvento(
+                construirEventoJSON("conmutacion_respaldo", "Suministro comercial restablecido").c_str())
+                != core::ResultadoPublicacion::Confirmado) {
+            LOG_E("Core1", "El broker no confirmo el evento de recuperacion de suministro.");
+        }
+    }
+    if (estado.nivelBajo) {
+        LOG_E("Core1", "Nivel de respaldo bajo el umbral configurado.");
+        if (mqtt.isConnected() &&
+            mqtt.publicarEvento(
+                construirEventoJSON("respaldo_bajo", "Nivel de respaldo bajo el umbral configurado")
+                    .c_str())
+                != core::ResultadoPublicacion::Confirmado) {
+            LOG_E("Core1", "El broker no confirmo el evento de nivel de respaldo bajo.");
+        }
+    }
+}
+
 /// HU-44 escenario 2: relee el token MQTT de NVS y, si cambió (rotación o
 /// reaprovisionamiento aplicado por un técnico con el nodo encendido),
 /// reconecta con la credencial nueva SIN `ESP.restart()`. El historial en
@@ -337,6 +378,7 @@ void taskRed(void* parameter) {
     LOG_I("Core1", "Tarea de red iniciada en Core %d.", xPortGetCoreID());
     suscribirTareaAlWatchdog("Red");
     unsigned long ultimaRevisionCredenciales = millis();
+    unsigned long ultimoChequeoRespaldo = millis();
 
     for (;;) {
         alimentarWatchdog();
@@ -443,6 +485,24 @@ void taskRed(void* parameter) {
             revisarRotacionCredenciales();
         }
 
+        // ── 8. Continuidad ante corte eléctrico (HU-52) ─────────────
+        //
+        // Diagnóstico de infraestructura, no la variable del experimento: se
+        // revisa con su propio intervalo, más espaciado que el bucle de
+        // 100 ms. Limitación conocida (igual que HU-08/WIFI_RECONEXION_
+        // PROLONGADA): al vivir después del `continue` de Wi-Fi/MQTT de los
+        // pasos 1-2, un corte que se autorresuelve ANTES de que la red se
+        // reconecte puede no dejar rastro de la transición — la lectura
+        // térmica de ese periodo sí queda íntegra en LittleFS (HU-06), solo
+        // el evento de diagnóstico puede perderse. Corregirlo de raíz exige
+        // detectarlo en Core 0 (que sí corre sin red) y colas cruzadas entre
+        // núcleos — no se justifica sin el circuito real para validar contra
+        // qué duración de corte importa.
+        if ((unsigned long)(millis() - ultimoChequeoRespaldo) >= INTERVALO_CHEQUEO_RESPALDO_MS) {
+            ultimoChequeoRespaldo = millis();
+            revisarRespaldoElectrico();
+        }
+
         delay(100);  // Ceder tiempo al scheduler de FreeRTOS
     }
 }
@@ -468,6 +528,10 @@ void setup() {
     // ── Watchdog ────────────────────────────────────────────────────
     // Antes de crear las tareas: ambas se suscriben nada más arrancar.
     inicializarWatchdog();
+
+    // ── Respaldo eléctrico (HU-52) ──────────────────────────────────
+    // Sin RESPALDO_INSTALADO no toca ningún pin (ver PowerBackup.cpp).
+    inicializarRespaldo();
 
     // ── Credenciales (RNF-05) ───────────────────────────────────────
     credenciales = cargarCredenciales();
@@ -528,6 +592,15 @@ void setup() {
     // ── Inicializar MQTT ────────────────────────────────────────────
     mqtt.begin(credenciales.mqttHost.c_str(), MQTT_PORT, MQTT_USERNAME,
                credenciales.mqttToken.c_str(), MQTT_CLIENT_ID);
+
+    // ── boot_id (HU-01/HU-11) ────────────────────────────────────────
+    // ANTES de crear taskSensores: PayloadBuilder::setBootId() escribe una
+    // variable estática sin sección crítica porque este es su único escritor
+    // y ocurre antes de que exista ningún lector concurrente (mismo patrón
+    // que `credenciales`, fijada también antes de las tareas).
+    const uint32_t bootId = cargarEIncrementarBootId();
+    PayloadBuilder::setBootId(bootId);
+    Serial.printf("[Setup] boot_id=%lu\n", (unsigned long)bootId);
 
     // ── Crear tareas en núcleos separados ───────────────────────────
     // Core 0: Sensores (prioridad más alta: la captura no puede retrasarse).

@@ -21,6 +21,9 @@ static core::Lectura lecturaBase() {
     l.firmwareVersion = "1.0.0";
     l.timestamp = "2026-07-25T12:34:56Z";
     l.readingId = "FARM-01-CDL_2026-07-25T12:34:56Z";
+    l.bootId = 3;
+    l.seqNo = 118;
+    l.tiempoSincronizado = true;
     l.online = true;
     l.temperaturaInterna = 4.5f;
     l.temperaturaAmbiental = 5.2f;
@@ -37,6 +40,9 @@ void test_payload_coincide_con_el_documentado(void) {
         "\"timestamp\":\"2026-07-25T12:34:56Z\","
         "\"schema_version\":1,"
         "\"reading_id\":\"FARM-01-CDL_2026-07-25T12:34:56Z\","
+        "\"boot_id\":3,"
+        "\"seq_no\":118,"
+        "\"time_quality\":\"synced\","
         "\"estado_conectividad\":\"online\","
         "\"firmware_version\":\"1.0.0\","
         "\"temperatura_interna\":4.50,"
@@ -228,6 +234,29 @@ void test_duracion_de_apertura_muy_larga(void) {
     TEST_ASSERT_TRUE(json.find("\"duracion_apertura_segundos\":4000000000") != std::string::npos);
 }
 
+// ── HU-01/HU-11: identidad real (boot_id+seq_no) y calidad de tiempo ───────
+
+void test_boot_id_y_seq_no_se_emiten(void) {
+    core::Lectura l = lecturaBase();
+    l.bootId = 9;
+    l.seqNo = 0;
+    const std::string json = core::serializarLectura(l);
+    TEST_ASSERT_TRUE(json.find("\"boot_id\":9") != std::string::npos);
+    TEST_ASSERT_TRUE(json.find("\"seq_no\":0") != std::string::npos);
+}
+
+void test_time_quality_synced_por_defecto(void) {
+    const std::string json = core::serializarLectura(lecturaBase());
+    TEST_ASSERT_TRUE(json.find("\"time_quality\":\"synced\"") != std::string::npos);
+}
+
+void test_time_quality_unsynced_cuando_no_hay_referencia_ntp(void) {
+    core::Lectura l = lecturaBase();
+    l.tiempoSincronizado = false;
+    const std::string json = core::serializarLectura(l);
+    TEST_ASSERT_TRUE(json.find("\"time_quality\":\"unsynced\"") != std::string::npos);
+}
+
 // ── HU-07: extracción del reading_id para correlacionar el acuse lógico ────
 
 void test_extraer_campo_string_encuentra_el_valor(void) {
@@ -260,6 +289,9 @@ void run_tests_payload(void) {
     RUN_TEST(test_duracion_de_apertura_muy_larga);
     RUN_TEST(test_payload_coincide_con_el_documentado);
     RUN_TEST(test_schema_version_y_reading_id_se_emiten);
+    RUN_TEST(test_boot_id_y_seq_no_se_emiten);
+    RUN_TEST(test_time_quality_synced_por_defecto);
+    RUN_TEST(test_time_quality_unsynced_cuando_no_hay_referencia_ntp);
     RUN_TEST(test_estado_por_sensor_ok_por_defecto);
     RUN_TEST(test_estado_por_sensor_distingue_averia_de_fuera_de_rango);
     RUN_TEST(test_mc38_no_instalado_emite_null_y_mc38_status);

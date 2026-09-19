@@ -61,6 +61,22 @@ std::string serializarLectura(const Lectura& lectura, size_t maxBytes) {
     }
     json += ",\"reading_id\":\"";
     json += escaparJSON(lectura.readingId);
+    // HU-01/HU-11: identidad real (boot_id+seq_no) y calidad de sincronización
+    // temporal, además de reading_id (compatibilidad hacia atrás).
+    json += "\",\"boot_id\":";
+    {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%lu", (unsigned long)lectura.bootId);
+        json += buf;
+    }
+    json += ",\"seq_no\":";
+    {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%lu", (unsigned long)lectura.seqNo);
+        json += buf;
+    }
+    json += ",\"time_quality\":\"";
+    json += (lectura.tiempoSincronizado ? "synced" : "unsynced");
     json += "\",\"estado_conectividad\":\"";
     json += (lectura.online ? "online" : "offline");
     json += "\",\"firmware_version\":\"";

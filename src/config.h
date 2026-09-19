@@ -107,6 +107,32 @@
   #define MC38_INSTALADO 1
 #endif
 
+// =========================================================================
+// HU-52: continuidad de medición ante corte de suministro eléctrico
+// =========================================================================
+// Hardware no validado en el prototipo actual: requiere el circuito de
+// respaldo de 5V (exclusivo para ESP32+sensores, nunca el refrigerador ni el
+// router) y su sensado. RESPALDO_INSTALADO=0 por defecto, mismo patrón que
+// MC38_INSTALADO — un nodo sin el circuito no intenta leer pines que no
+// existen ni publica eventos de un subsistema que no tiene.
+#ifndef RESPALDO_INSTALADO
+  #define RESPALDO_INSTALADO 0
+#endif
+// GPIO digital hacia el comparador del circuito de respaldo: HIGH mientras
+// hay suministro comercial, LOW al conmutar a la batería/respaldo de 5V.
+#define PIN_RESPALDO_SENSE          27
+// Entrada ADC sobre el divisor de tensión del respaldo, para estimar su
+// nivel restante. Rango y umbral se calibran en el piloto contra el circuito
+// real (HU-52 escenario 3: "la autonomía real del respaldo se mide y
+// documenta... no se fija por supuesto") — este valor es un punto de partida
+// conservador, no una autonomía comprometida.
+#define PIN_RESPALDO_BATERIA_ADC    34
+#define UMBRAL_RESPALDO_BATERIA_ADC 1200
+// Cada cuánto se relee el estado del respaldo desde taskRed — no hace falta
+// la cadencia de 30s de los sensores térmicos, esto es diagnóstico de
+// infraestructura, no la variable del experimento.
+#define INTERVALO_CHEQUEO_RESPALDO_MS 10000
+
 // Intervalos
 #define INTERVALO_LECTURA_MS   30000  // 30 segundos — cadencia de muestreo
 

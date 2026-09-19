@@ -60,6 +60,15 @@ struct Lectura {
     std::string firmwareVersion;
     std::string timestamp;   ///< ISO 8601 UTC: "2026-07-25T12:34:56Z"
     std::string readingId;   ///< HU-05: identidad lógica de ESTA lectura (deviceId + timestamp)
+    // HU-01/HU-11 (backlog 54 HU): identidad lógica real para idempotencia.
+    // bootId incrementa en cada arranque (persistido en NVS); seqNo es
+    // monótono dentro de ese boot (reinicia en 0 al reiniciar el nodo).
+    uint32_t bootId = 0;
+    uint32_t seqNo = 0;
+    // HU-01: calidad de la sincronización temporal en el instante de
+    // captura — false cuando el reloj aún no tiene referencia NTP y se
+    // ancla a la hora de compilación (ver Reloj::sincronizado()).
+    bool tiempoSincronizado = true;
     bool online = false;
 
     float temperaturaInterna = NAN;

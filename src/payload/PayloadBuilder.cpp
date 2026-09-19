@@ -101,13 +101,28 @@ void PayloadBuilder::setMc38Instalado(bool instalado) {
     _lectura.mc38Instalado = instalado;
 }
 
+// HU-01/HU-11: bootId se fija una sola vez desde setup() (single-writer antes
+// de crear las tareas, mismo patrón que las credenciales); seqNo es un
+// contador de proceso que solo taskSensores incrementa —un único llamador,
+// sin necesidad de sección crítica— y que reinicia en 0 al reiniciar el nodo,
+// exactamente la semántica de "monótono dentro de este boot".
+static uint32_t _bootIdActual = 0;
+static uint32_t _seqNoActual = 0;
+
+void PayloadBuilder::setBootId(uint32_t bootId) {
+    _bootIdActual = bootId;
+}
+
 String PayloadBuilder::build(unsigned int maxBytes) {
     _lectura.timestamp = std::string(timestampISO8601().c_str());
     // HU-05: reading_id reutiliza device_id+timestamp — ya es la clave de
-    // deduplicación del backend, así que no hace falta un contador ni RTC
-    // con persistencia propia. Se recalcula cada vez que se construye (no
-    // en el constructor) porque depende del timestamp recién fijado arriba.
+    // deduplicación de compatibilidad del backend para firmware anterior a
+    // boot_id+seq_no. Se recalcula cada vez que se construye (no en el
+    // constructor) porque depende del timestamp recién fijado arriba.
     _lectura.readingId = _lectura.deviceId + "_" + _lectura.timestamp;
+    _lectura.bootId = _bootIdActual;
+    _lectura.seqNo = _seqNoActual++;
+    _lectura.tiempoSincronizado = ntpEstaSincronizado();
 
     const std::string json = core::serializarLectura(_lectura, maxBytes);
     if (json.empty()) {
